@@ -8,7 +8,7 @@
 // `interrupted` outcome (interrupt.ts) the caller can act on, never an
 // exception. `replyTo` sends to the target a received message came from.
 
-import { agentApiExternalReplySchema } from "../agentApiMessageContract";
+import { agentApiReplyToSchema, agentApiCompletedInputsSchema } from "../agentApiMessageContract";
 import { z } from "zod";
 import { lazySchema } from "../lazySchema";
 
@@ -341,7 +341,8 @@ function cardLinesForRead(
 const SEND_TRANSPORT_ATTEMPTS = 3;
 
 export interface SendMessageRequest {
-  externalReply?: AgentApiSendV2Body["externalReply"];
+  replyTo?: string;
+  completedInputMessageIds?: string[];
   target: string;
   content: string;
   attachmentIds?: string[];
@@ -379,7 +380,8 @@ const sendMessageFields = {
 };
 
 export const sendMessageRequestSchema = lazySchema("sendMessageRequestSchema", () => requestSchema<SendMessageRequest>()(z.object({
-  externalReply: agentApiExternalReplySchema.optional(),
+  replyTo: agentApiReplyToSchema.optional(),
+  completedInputMessageIds: agentApiCompletedInputsSchema.optional(),
   target: raftTargetSchema,
   ...sendMessageFields,
 })));
@@ -390,6 +392,8 @@ export interface ReplyToRequest extends Omit<SendMessageRequest, "target"> {
 }
 
 export const replyToRequestSchema = lazySchema("replyToRequestSchema", () => requestSchema<ReplyToRequest>()(z.object({
+  replyTo: agentApiReplyToSchema.optional(),
+  completedInputMessageIds: agentApiCompletedInputsSchema.optional(),
   message: z.object({ target: raftTargetSchema }).describe("The received message to reply to; only its `target` is used."),
   ...sendMessageFields,
 })));
@@ -611,7 +615,8 @@ export async function sendMessage(
     ? { ...(request.seen.upToSeq === undefined ? {} : { seenUpToSeq: request.seen.upToSeq }), seenExactSeqs: request.seen.exactSeqs ?? [] }
     : frontier?.attestation(request.target) ?? { seenExactSeqs: [] };
   const body: AgentApiSendV2Body = {
-    ...(request.externalReply ? { externalReply: request.externalReply } : {}),
+    ...(request.replyTo ? { replyTo: request.replyTo } : {}),
+    ...(request.completedInputMessageIds?.length ? { completedInputMessageIds: request.completedInputMessageIds } : {}),
     target: request.target,
     content: request.content,
     ...(request.attachmentIds?.length ? { attachmentIds: request.attachmentIds } : {}),

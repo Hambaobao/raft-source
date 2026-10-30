@@ -13,7 +13,8 @@ import type {
   AgentApiStructuredMention,
 } from "@botiverse/raft-shared";
 import {
-  agentApiExternalReplySchema,
+  agentApiReplyToSchema,
+  agentApiCompletedInputsSchema,
   currentTimeMs,
   formatAgentThreadTargetCheck,
   structuredRaftMentionStillAppears,
@@ -87,8 +88,9 @@ export {
 } from "./_format";
 
 interface SendOpts extends ReviewerIsolationOpts {
-  externalReplyTo?: string;
-  externalReplyTitle?: string;
+  replyTo?: string;
+  complete?: string[];
+  text?: string;
   target: string;
   content?: string;
   attachmentId?: string[];
@@ -350,13 +352,10 @@ export function rejectArgContent(positionalContent: string[], opts: Pick<SendOpt
 }
 
 export function validateDraftSendFlags(
-  opts: Pick<SendOpts, "sendDraft" | "discardDraft" | "expectedDraftKey" | "anyway" | "attachmentId" | "mention" | "externalReplyTo" | "externalReplyTitle">,
+  opts: Pick<SendOpts, "sendDraft" | "discardDraft" | "expectedDraftKey" | "anyway" | "attachmentId" | "mention" | "replyTo" | "complete" | "text">,
 ): void {
-  if ((opts.sendDraft || opts.discardDraft) && (opts.externalReplyTo !== undefined || opts.externalReplyTitle !== undefined)) {
-    throw new SendContentError("EXTERNAL_REPLY_DRAFT_OVERRIDE", "External reply routing is saved with the draft. Use --send-draft without reply flags, or a new send to change the reply.");
-  }
-  if (opts.externalReplyTitle !== undefined && opts.externalReplyTo === undefined) {
-    throw new SendContentError("EXTERNAL_REPLY_TARGET_REQUIRED", "--external-reply-title requires --external-reply-to.");
+  if ((opts.sendDraft || opts.discardDraft) && (opts.replyTo !== undefined || opts.complete !== undefined || opts.text !== undefined)) {
+    throw new SendContentError("REPLY_DRAFT_OVERRIDE", "Message text, quote and completion are saved with the draft. Resume it without --text/--reply-to/--complete, or start a new send.");
   }
   if (opts.discardDraft && opts.sendDraft) {
     throw new SendContentError(
@@ -693,11 +692,14 @@ async function handleMessageSend(
     if (err instanceof SendContentError) throw cliError(err.code, err.message, { cause: err });
     throw err;
   }
-  let outgoingExternalReply: AgentApiSendV2Body["externalReply"];
-  if (opts.externalReplyTo !== undefined) {
-    const parsed = agentApiExternalReplySchema.safeParse({ messageId: opts.externalReplyTo, ...(opts.externalReplyTitle === undefined ? {} : { title: opts.externalReplyTitle }) });
-    if (!parsed.success) throw cliError("INVALID_EXTERNAL_REPLY", "Use the original message's full UUID or 8-character msg ID; an optional title must be 1-120 characters.");
-    outgoingExternalReply = parsed.data;
+  const completion = agentApiCompletedInputsSchema.safeParse(opts.complete ?? []);
+  if (!completion.success) throw cliError("INVALID_COMPLETION", "--complete accepts up to 100 input message IDs (8 characters or full UUIDs).");
+  let completedInputMessageIds = [...new Set(completion.data)];
+  let outgoingReplyTo: string | undefined;
+  if (opts.replyTo !== undefined) {
+    const parsed = agentApiReplyToSchema.safeParse(opts.replyTo);
+    if (!parsed.success) throw cliError("INVALID_REPLY_TARGET", "Use the original message full UUID or 8-character msg ID.");
+    outgoingReplyTo = parsed.data;
   }
   let content: string | undefined;
   let outgoingContent = "";
@@ -724,7 +726,7 @@ async function handleMessageSend(
     try {
       // Checked before stdin is consumed, so a bad id costs no message body.
       outgoingAttachmentIds = normalizeAttachmentIdFlags(opts.attachmentId ?? [], target);
-      content = await resolveSendContent(ctx.io.stdin ?? process.stdin);
+      content = opts.text !== undefined ? opts.text : await resolveSendContent(ctx.io.stdin ?? process.stdin);
     } catch (err) {
       if (err instanceof SendContentError) throw cliError(err.code, err.message, { cause: err });
       throw err;
@@ -805,7 +807,8 @@ async function handleMessageSend(
         },
       );
     }
-    outgoingExternalReply = savedDraft.externalReply;
+    outgoingReplyTo = savedDraft.replyTo;
+    completedInputMessageIds = savedDraft.completedInputMessageIds ?? [];
     outgoingContent = savedDraft.content;
     outgoingAttachmentIds = savedDraft.attachmentIds;
     outgoingMentions = explicitMentions.length > 0 ? explicitMentions : (savedDraft.mentions ?? []);
@@ -818,7 +821,8 @@ async function handleMessageSend(
         ...savedDraft,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+        ...(completedInputMessageIds.length ? { completedInputMessageIds } : {}),
       });
     }
     setFailureDraftSaved(true);
@@ -856,7 +860,8 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+        ...(completedInputMessageIds.length ? { completedInputMessageIds } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount,
         seenUpToSeq,
@@ -901,7 +906,8 @@ async function handleMessageSend(
   const body: AgentApiSendV2Body = {
     target,
     content: outgoingContent,
-    ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+    ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+    ...(completedInputMessageIds.length ? { completedInputMessageIds } : {}),
     idempotencyKey,
     draftReholdCount: previousDraftReholdCount,
   };
@@ -948,7 +954,8 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+        ...(completedInputMessageIds.length ? { completedInputMessageIds } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount,
         seenUpToSeq,
@@ -1090,7 +1097,8 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+        ...(completedInputMessageIds.length ? { completedInputMessageIds } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount + 1,
         // A hold for the card alone showed no messages: keep what was attested.
@@ -1314,8 +1322,9 @@ export const messageSendCommand = defineCommand(
     options: [
       { flags: "--target <target>", description: "Target: '#channel', 'dm:@peer', '#channel:shortid', 'dm:@peer:shortid' (a thread: shortid is its root message's msg=, as in replyTarget)" },
       PEER_KIND_OPTION,
-      { flags: "--external-reply-to <message-id>", description: "Submit a user-facing answer to an external connector. Use the original message's msg ID in this same --target; internal discussion must omit this flag. The connector validates sender/current task and handles external delivery. The send receipt confirms Raft persistence, not external delivery." },
-      { flags: "--external-reply-title <title>", description: "Suggest a conversation title with an external reply (1-120 characters); requires --external-reply-to." },
+      { flags: "--text <text>", description: "Message body. When omitted, read the body from stdin. Not available with --send-draft/--discard-draft." },
+      { flags: "--complete <message-id>", description: "Confirm this answer handles this input (repeatable). Independent of --reply-to; does not quote or change recipients. Use only with a finished answer or a question returning control to the user, not acknowledgments/progress. IDs are saved with drafts.", parse: (value, prev: string[] = []) => prev.concat(value) },
+      { flags: "--reply-to <message-id>", description: "Explicitly quote this message in the same --target without creating a subthread. Optional; does not mark any input complete. Saved with held drafts." },
       {
         flags: "--send-draft",
         description:

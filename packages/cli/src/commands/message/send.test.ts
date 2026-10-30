@@ -3455,26 +3455,46 @@ test("5xx guidance is only attached when a draft was actually saved", () => {
   assert.equal(notSaved.suggestedNextAction, undefined);
 });
 
-test("external reply routing survives a held draft and its retry without body markers", async () => {
-  process.env.SLOCK_CLI_DRAFT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "raft-external-reply-"));
+test("native in-conversation reply survives a held draft and its retry", async () => {
+  process.env.SLOCK_CLI_DRAFT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "raft-reply-"));
   const h = ambiguousSendHarness([
     { ok: true, status: 200, error: null, data: { ok: true, state: "held", heldMessages: [], newMessageCount: 0, shownMessageCount: 0, omittedMessageCount: 0, seenUpToSeq: 0 } },
     { ok: true, status: 200, error: null, data: { ok: true, state: "sent", messageId: "reply" } },
   ]);
-  await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", externalReplyTo: ATTACHMENT_A, externalReplyTitle: " Price " }), /Message held as draft/);
-  assert.deepEqual(h.bodies[0]!.externalReply, { messageId: ATTACHMENT_A, title: "Price" });
+  await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", replyTo: ATTACHMENT_A, complete: [ATTACHMENT_A, ATTACHMENT_B] }), /Message held as draft/);
+  assert.equal(h.bodies[0]!.replyTo, ATTACHMENT_A);
+  assert.deepEqual(h.bodies[0]!.completedInputMessageIds, [ATTACHMENT_A, ATTACHMENT_B]);
   assert.equal(h.bodies[0]!.content, "one logical send\n");
-  assert.deepEqual(getSavedDraft("agent-send-reconcile", "#room")?.externalReply, h.bodies[0]!.externalReply);
+  assert.equal(getSavedDraft("agent-send-reconcile", "#room")?.replyTo, ATTACHMENT_A);
   h.ctx.io.stdin = Readable.from([]);
   await messageSendCommand.handler(h.ctx, [], { target: "#room", sendDraft: true });
-  assert.deepEqual(h.bodies[1]!.externalReply, h.bodies[0]!.externalReply);
+  assert.equal(h.bodies[1]!.replyTo, ATTACHMENT_A);
+  assert.deepEqual(h.bodies[1]!.completedInputMessageIds, [ATTACHMENT_A, ATTACHMENT_B]);
   assert.equal(h.bodies[1]!.idempotencyKey, h.bodies[0]!.idempotencyKey);
 });
 
-test("external reply flags reject invalid references and draft retargeting before any request", async () => {
-  for (const opts of [{ externalReplyTo: "bad-id" }, { externalReplyTitle: "title" }, { externalReplyTo: ATTACHMENT_A, externalReplyTitle: " " }, { sendDraft: true, externalReplyTo: ATTACHMENT_B }, { discardDraft: true, externalReplyTitle: "title" }]) {
+test("native reply flags reject invalid references and draft retargeting before any request", async () => {
+  for (const opts of [{ replyTo: "bad-id" }, { sendDraft: true, replyTo: ATTACHMENT_B }, { discardDraft: true, replyTo: ATTACHMENT_A }]) {
     const h = ambiguousSendHarness([]);
     await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", ...opts }));
     assert.equal(h.bodies.length, 0);
   }
+});
+
+
+test("completion rejects invalid references and draft overrides before sending", async () => {
+  for (const opts of [{ complete: ["bad-id"] }, { complete: Array(101).fill(ATTACHMENT_A) }, { sendDraft: true, complete: [ATTACHMENT_A] }, { sendDraft: true, text: "replacement" }]) {
+    const h = ambiguousSendHarness([]);
+    await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", ...opts }));
+    assert.equal(h.bodies.length, 0);
+  }
+});
+
+test("direct text and completion do not require a quotation or stdin", async () => {
+  const h = ambiguousSendHarness([{ ok: true, status: 200, error: null, data: { ok: true, state: "sent", messageId: "answer" } }]);
+  h.ctx.io.stdin = new Readable({ read() { throw new Error("stdin must not be read with --text"); } });
+  await messageSendCommand.handler(h.ctx, [], { target: "#room", text: "plain answer", complete: [ATTACHMENT_A] });
+  assert.equal(h.bodies[0]!.content, "plain answer");
+  assert.equal(h.bodies[0]!.replyTo, undefined);
+  assert.deepEqual(h.bodies[0]!.completedInputMessageIds, [ATTACHMENT_A]);
 });

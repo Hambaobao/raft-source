@@ -97,6 +97,11 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
     principal: "sk_agent",
     note: "locator-only feedback v0 — content-free triage index query",
   },
+  { method: "POST", path: "/internal/agent-api/external-messages/:bindingId/topics/:channelId/messages", principal: "sk_agent", note: "Bound user transport in Bridge-administered private channels" },
+  { method: "GET", path: "/internal/agent-api/external-messages/:bindingId/topics/:channelId/messages", principal: "sk_agent", note: "Bound channel stream of leader mentions and replies to the user" },
+  { method: "GET", path: "/internal/agent-api/external-messages/:bindingId", principal: "sk_agent", note: "Deployment-bound external human message transport" },
+  { method: "POST", path: "/internal/agent-api/external-messages/:bindingId/messages", principal: "sk_agent", note: "Deployment-bound external human message transport" },
+  { method: "GET", path: "/internal/agent-api/external-messages/:bindingId/messages/:messageId/replies", principal: "sk_agent", note: "Deployment-bound external human message transport" },
   {
     method: "GET",
     path: "/internal/agent-api/context",

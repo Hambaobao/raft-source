@@ -1,3 +1,4 @@
+import { messageRelationIdentity } from "./messageRelations";
 import { and, eq } from "drizzle-orm";
 import { getDb, type Database, type DatabaseExecutor } from "../db/index";
 import { attachments, messages } from "../db/schema";
@@ -43,9 +44,9 @@ export class AgentSendIdempotencyConflictError extends Error {
   readonly status = 409 as const;
   readonly code = "idempotency_key_reused" as const;
   readonly suggestedNextAction = "use a new idempotencyKey for different content";
-  readonly mismatch: "target" | "content" | "attachments" | "external_reply";
+  readonly mismatch: "target" | "content" | "attachments" | "reply";
 
-  constructor(mismatch: "target" | "content" | "attachments" | "external_reply") {
+  constructor(mismatch: "target" | "content" | "attachments" | "reply") {
     super(`idempotencyKey was already used for a message with a different ${mismatch}; use a new idempotencyKey for different content`);
     this.name = "AgentSendIdempotencyConflictError";
     this.mismatch = mismatch;
@@ -167,12 +168,8 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
       if (replayedMessage.channelId !== channelId) {
         throw new AgentSendIdempotencyConflictError("target");
       }
-      const replyIdentity = (value: unknown) => {
-        const metadata = value as { kind?: string; messageId?: string; title?: string } | null;
-        return metadata?.kind === "external-reply" ? JSON.stringify([metadata.messageId, metadata.title ?? null]) : null;
-      };
-      if (replyIdentity(replayedMessage.actionMetadata) !== replyIdentity(opts.actionMetadata)) {
-        throw new AgentSendIdempotencyConflictError("external_reply");
+      if (messageRelationIdentity(replayedMessage.actionMetadata) !== messageRelationIdentity(opts.actionMetadata)) {
+        throw new AgentSendIdempotencyConflictError("reply");
       }
       if (replayedMessage.content !== content) {
         throw new AgentSendIdempotencyConflictError("content");

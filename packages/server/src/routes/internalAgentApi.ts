@@ -1,3 +1,6 @@
+import type { MessageRelations } from "../services/messageRelations";
+import { externalTopicSend, externalTopicMessages } from "./externalTopicMessages";
+import { externalDmBinding, externalDmSend, externalDmReplies } from "./externalMessages";
 import { raftbenchContextQuerySchema, raftbenchReportSchema } from "@botiverse/raft-shared";
 import { readContext as readRaftbenchContext, submitReport as submitRaftbenchReport, RaftbenchError } from "../raftbench/service";
 import { getAppInstallationSetup } from "../services/appSetupService";
@@ -2474,7 +2477,7 @@ registerAgentApiRoute("agentContext", async (req, res) => {
       server: { id: server.id, slug: server.slug, name: server.name },
       credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
       prompt,
-      features: { ...await agentContextFeatures(serverId), externalReplies: true },
+      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true, messageBodyReads: true, messageCompletions: true, externalDmStream: true },
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -5143,7 +5146,8 @@ async function handleAgentApiMessageSend(
       target,
       content,
       attachmentIds,
-      externalReply,
+      replyTo,
+      completedInputMessageIds,
       idempotencyKey,
       reconcileOnly,
       continue: deprecatedContinue,
@@ -5328,18 +5332,35 @@ async function handleAgentApiMessageSend(
       throw err;
     }
 
-    let replyMetadata: { kind: "external-reply"; messageId: string; title?: string } | undefined;
-    if (externalReply) {
-      const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, externalReply.messageId);
+    // Retired fields fail visibly; silently dropping completion could strand feedback.
+    if (Object.prototype.hasOwnProperty.call(req.body, "replyPhase")) {
+      res.status(400).json({ error: "Use completedInputMessageIds independently of replyTo", code: "reply_phase_removed" });
+      return;
+    }
+    const replyMetadata: MessageRelations = { kind: "message" };
+    if (replyTo) {
+      const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, replyTo);
       const original = reference.ok ? await messageService.getMessage(reference.messageId) : null;
-      // Restrict this first connector contract to the same local conversation.
-      // No cross-channel pointers or hidden-message existence are exposed.
       if (!original || original.channelId !== resolved.channelId) {
-        res.status(404).json({ error: "Reply message is not available in this conversation", code: "external_reply_not_found" });
+        res.status(404).json({ error: "Reply message is not available in this conversation", code: "reply_not_found" });
         return;
       }
-      replyMetadata = { kind: "external-reply", messageId: original.id, ...(externalReply.title === undefined ? {} : { title: externalReply.title }) };
+      replyMetadata.replyTo = original.id;
     }
+    const completedIds = new Set<string>();
+    for (const id of completedInputMessageIds ?? []) {
+      const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, id);
+      const original = reference.ok ? await messageService.getMessage(reference.messageId) : null;
+      const source = original?.actionMetadata as Record<string, unknown> | null;
+      if (!original || original.channelId !== resolved.channelId || original.senderType !== "user"
+        || original.messageType !== "chat"
+        || ((source?.kind === "external-dm" || source?.kind === "external-topic") && source.recipientAgentId !== actingAgentId)) {
+        res.status(404).json({ error: "Input is not available for completion in this conversation", code: "completion_not_found" });
+        return;
+      }
+      completedIds.add(original.id);
+    }
+    if (completedIds.size) replyMetadata.completedInputMessageIds = [...completedIds].sort();
 
     // Cards (passive AX): the target's channel card (`seenCards.channel`) and
     // a DM target's peer card (`seenCards.peer`), each only for a client that
@@ -5504,7 +5525,7 @@ async function handleAgentApiMessageSend(
         senderId: actingAgentId,
         senderName: agent.displayName || agent.name || "Agent",
         content,
-        ...(replyMetadata ? { actionMetadata: replyMetadata } : {}),
+        ...(replyMetadata.replyTo || replyMetadata.completedInputMessageIds?.length ? { actionMetadata: replyMetadata } : {}),
         mentions,
         mentionContract: routeKey === "messageSendV2" ? "v2" : "v1",
         attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [],
@@ -9654,3 +9675,10 @@ registerAgentApiRoute("raftbenchSubmit", validateAgentApiResponseMiddleware("raf
   try { sendAgentApiResponse("raftbenchSubmit", res, await submitRaftbenchReport(req.serverId!, req.actingAgentId!, parsed.data)); }
   catch (error) { sendRaftbenchError(error, res); }
 });
+
+// Narrow deployment-authorized external user DM transport. It never grants generic user API access.
+internalAgentApiRouter.post("/external-messages/:bindingId/topics/:channelId/messages", requireAgentCapability("send"), requireAgentGrant("message:send"), externalTopicSend);
+internalAgentApiRouter.get("/external-messages/:bindingId/topics/:channelId/messages", requireAgentCapability("read"), requireAgentGrant("message:read"), externalTopicMessages);
+internalAgentApiRouter.get("/external-messages/:bindingId", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmBinding);
+internalAgentApiRouter.post("/external-messages/:bindingId/messages", requireAgentCapability("send"), requireAgentGrant("message:send"), externalDmSend);
+internalAgentApiRouter.get("/external-messages/:bindingId/messages/:messageId/replies", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmReplies);

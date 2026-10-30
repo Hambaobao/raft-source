@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import {
   conversionReadChannelPredicate,
   resolveConversionReadChannelIds,
@@ -2772,9 +2773,13 @@ async function createOrReplayUserRandomSend(opts: {
         && typeof replayedMessage.actionMetadata._forwardRequestDigest === "string"
         ? replayedMessage.actionMetadata._forwardRequestDigest
         : null;
+      const isExternalInput = (metadata: unknown) => isRecord(metadata) && ["external-dm", "external-topic"].includes(String(metadata.kind));
+      const externalMessageReplay = isExternalInput(opts.actionMetadata) || isExternalInput(replayedMessage.actionMetadata);
       if (
         replayedMessage.channelId !== opts.channelId
         || expectedForwardDigest !== replayedForwardDigest
+        || (externalMessageReplay && (replayedMessage.content !== opts.content
+          || !isDeepStrictEqual(replayedMessage.actionMetadata, opts.actionMetadata)))
       ) {
         throw new UserRandomIdConflictError();
       }
