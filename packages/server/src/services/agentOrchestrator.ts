@@ -8590,7 +8590,29 @@ export class AgentOrchestrator extends EventEmitter {
     });
   }
 
+  private readonly mentionReceiptQueues = new Map<string, Promise<void>>();
+
   async handleMachineMessage(machineId: string, msg: MachineToServerMessage, ws?: WebSocket) {
+    // WebSocket callbacks run concurrently. Persist one occurrence's receipts in
+    // wire order so its ACK cannot overtake the preceding drained write. Other
+    // occurrences and non-receipt frames remain independent.
+    const trackedReceipt = (msg.type === "agent:delivery:transition"
+      || msg.type === "agent:delivery:terminal_error"
+      || msg.type === "agent:deliver:ack") && msg.mentionDelivery;
+    if (!trackedReceipt) return this.handleMachineMessageNow(machineId, msg, ws);
+
+    const key = JSON.stringify([machineId, trackedReceipt.occurrenceId]);
+    const previous = this.mentionReceiptQueues.get(key) ?? Promise.resolve();
+    const pending = previous.catch(() => {}).then(() => this.handleMachineMessageNow(machineId, msg, ws));
+    this.mentionReceiptQueues.set(key, pending);
+    try {
+      await pending;
+    } finally {
+      if (this.mentionReceiptQueues.get(key) === pending) this.mentionReceiptQueues.delete(key);
+    }
+  }
+
+  private async handleMachineMessageNow(machineId: string, msg: MachineToServerMessage, ws?: WebSocket) {
     const conn = this.machineConnections.get(machineId);
     // A replaced socket can still have a buffered message callback queued.
     // Never let an old legacy principal act through the current Computer
