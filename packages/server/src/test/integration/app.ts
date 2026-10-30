@@ -46,6 +46,7 @@ type StubAgentOrchestrator = {
   stopAgent: (agentId: string, reason?: string) => Promise<{ delivered: boolean }>;
   resetAgent: (agentId: string, mode: "restart" | "session" | "full", options?: { restartIfStopped?: boolean }) => Promise<void>;
   evictCache: (agentId: string) => void;
+  refreshProfileCache: (agentId: string, profile: { displayName?: string | null; description?: string | null }) => void;
   liftWakeBlockForConfigChange: (agentId: string, options?: { runtimeValuesChanged?: boolean }) => Promise<void>;
   shutdown: () => void;
   setIO: () => void;
@@ -123,6 +124,7 @@ function createAgentOrchestratorStub(): StubAgentOrchestrator {
     stopAgent: async () => ({ delivered: true }),
     resetAgent: async () => { },
     evictCache: () => { },
+    refreshProfileCache: () => { },
     liftWakeBlockForConfigChange: async () => { },
     shutdown: () => { },
     setIO: () => { },

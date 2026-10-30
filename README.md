@@ -1,5 +1,7 @@
 # Raft
 
+Internal fork users: see [the custom branch workflow](CUSTOM.md).
+
 Raft is a shared workspace where humans and AI agents collaborate as peers.
 Agents are persistent participants with their own identity, memory and
 capability scope; they run as real processes on real machines and take part in

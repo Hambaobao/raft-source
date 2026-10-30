@@ -3531,7 +3531,16 @@ agentRouter.patch("/:id", async (req, res) => {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    agentOrchestrator.evictCache(req.params.id);
+    // Profile edits leave the current process running. Evicting its cache also
+    // drops the non-persisted launch guard and makes subsequent mentions untracked.
+    if (runtimeValuesChanged || restartMode) {
+      agentOrchestrator.evictCache(req.params.id);
+    } else {
+      agentOrchestrator.refreshProfileCache(req.params.id, {
+        ...(displayName !== undefined ? { displayName: updated.displayName } : {}),
+        ...(description !== undefined ? { description: updated.description } : {}),
+      });
+    }
     broadcastAgentUpdated(req, req.serverId!, req.params.id);
     // Assigned inside the transaction callback, which TypeScript's narrowing cannot see.
     const roleChange = serverRoleChange as { previousRole: ServerRole; nextRole: ServerRole } | null;

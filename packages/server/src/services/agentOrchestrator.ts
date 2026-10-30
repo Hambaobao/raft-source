@@ -6098,7 +6098,15 @@ export class AgentOrchestrator extends EventEmitter {
     return Boolean(current && this.isStartingActivitySnapshot(current));
   }
 
-  /** Remove agent from cache */
+  /** Refresh edited profile fields without discarding the live launch/session guard. */
+  refreshProfileCache(agentId: string, profile: Partial<Pick<PersistedAgentRow, "displayName" | "description">>) {
+    this.updateCache(agentId, {
+      ...(profile.displayName !== undefined ? { displayName: profile.displayName } : {}),
+      ...(profile.description !== undefined ? { description: profile.description } : {}),
+    });
+  }
+
+  /** Remove agent from cache (runtime changes, resets, reassignment or deletion). */
   evictCache(agentId: string) {
     this.agentStateCache.delete(agentId);
   }
