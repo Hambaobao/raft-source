@@ -58,3 +58,20 @@ test("native replies reject invalid, hidden and cross-channel origins", async ({
   const { apiKey } = await mintAgentCredential({ agentId: h.agent.id, scopes: ["read"], name: "read-only", createdByUserId: null });
   assert.equal((await h.call("/send", { target: `#${h.channel.name}`, content: "denied", replyTo: h.original.id }, apiKey)).status, 403);
 });
+
+test("reply phases survive native history and reject a changed phase under the same send key", async ({ db, app }) => {
+  const h = await fixture(db, app.baseUrl);
+  for (const phase of ["progress", "final"]) {
+    const key = randomUUID();
+    const response = await h.send({ replyPhase: phase, idempotencyKey: key });
+    const result = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(result));
+    const [stored] = await db.select().from(messages).where(eq(messages.id, result.messageId));
+    assert.deepEqual(stored.actionMetadata, { kind: "reply", messageId: h.original.id, phase });
+    const again = await h.send({ replyPhase: phase, idempotencyKey: key });
+    assert.equal((await again.json()).messageId, result.messageId);
+    assert.equal((await h.send({ replyPhase: phase === "final" ? "progress" : "final", idempotencyKey: key })).status, 409);
+  }
+  assert.equal((await h.send({ replyTo: undefined, replyPhase: "final" })).status, 400);
+  assert.equal((await h.send({ replyPhase: "done" })).status, 400);
+});

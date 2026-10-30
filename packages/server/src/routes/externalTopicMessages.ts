@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { and, asc, eq, gt, inArray } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { channelAgents, messages, messageMentions, agentChannelReadCursors } from "../db/schema";
+import { channelAgents, messages, messageMentions, agentChannelReadCursors, agentMessageBodyReads } from "../db/schema";
 import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
@@ -15,7 +15,9 @@ import { sendJsonServerError } from "./errorResponse";
 
 const conversationId = z.string().min(1).max(512);
 const inputSchema = externalMessageInputSchema.extend({ externalConversationId: conversationId, mentionRecipient: z.boolean() });
-const lookupSchema = externalMessageLookupSchema.extend({ externalConversationId: conversationId, anchorMessageId: z.string().uuid() });
+const lookupSchema = externalMessageLookupSchema.extend({ externalConversationId: conversationId, anchorMessageId: z.string().uuid(),
+  readMessageIds: z.string().max(3699).transform(value => value.split(",")).pipe(z.array(z.string().uuid()).max(100)).optional(),
+});
 function unavailable(res: Response) { res.status(404).json({ code: "external_topic_unavailable" }); }
 
 // Explicit deployment opt-in delegates writing as one bound user only in private
@@ -128,8 +130,21 @@ export async function externalTopicMessages(req: Request, res: Response) {
     });
     const [cursor] = await db.select({ seq: agentChannelReadCursors.lastReadSeq }).from(agentChannelReadCursors)
       .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, channel.id)));
+    // Only return exact facts for requested inputs belonging to this binding,
+    // human and conversation; never expose another channel's consumption.
+    const requested = parsed.data.readMessageIds ?? [];
+    const readInputs = requested.length ? await db.select({ id: messages.id, metadata: messages.actionMetadata })
+      .from(messages).innerJoin(agentMessageBodyReads, eq(agentMessageBodyReads.messageId, messages.id))
+      .where(and(eq(agentMessageBodyReads.agentId, agent.id), eq(messages.channelId, channel.id),
+        eq(messages.senderType, "user"), eq(messages.senderId, user.id), inArray(messages.id, requested))) : [];
+    const readMessageIds = readInputs.filter(input => {
+      const source = input.metadata as Record<string, unknown> | null;
+      return source?.kind === "external-topic" && source.bindingId === binding.id
+        && source.bridgeAgentId === binding.bridgeAgentId && source.recipientAgentId === agent.id
+        && source.externalUserId === binding.externalUserId && source.externalConversationId === parsed.data.externalConversationId;
+    }).map(input => input.id);
     res.json({ anchorMessageId: origin.id, channelId: channel.id, recipientId: user.id, coordinatorId: agent.id,
       messages: await externalReplyPresentation(addressed, user.id), nextSeq: batch.at(-1)?.seq ?? after, hasMore: batch.length === 100,
-      delivery: { targetHandle: agent.name, lastReadSeq: cursor?.seq ?? 0, signal: "read_cursor" } });
+      delivery: { targetHandle: agent.name, lastReadSeq: cursor?.seq ?? 0, readMessageIds, signal: "message_body_read_or_cursor" } });
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to read topic messages", logPrefix: "external-topic.messages", err }); }
 }

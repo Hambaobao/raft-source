@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { eq } from "drizzle-orm";
+import { agentMessageBodyReads } from "../db/schema";
 
 import { dbTest } from "../test/integration/dbTest";
 import { applyAgentModelSeen } from "./agentModelSeen";
@@ -77,4 +79,21 @@ dbTest("agent:model-seen ignores a conversation on another server, even a public
   const result = await applyAgentModelSeen({ agentId: agent.id, serverId: server.id, channelId: foreign.id, seqs: [message.seq] }, settledNow);
   assert.deepEqual(result, { outcome: "unchanged", reason: "no_access" });
   assert.equal(await getAgentLegacyReadCursor(agent.id, foreign.id), 0);
+});
+
+dbTest("sparse body consumption is durable even when a gap or settle window blocks the read cursor", async ({ seed, db }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const channel = await seed.channel({ server, members: [owner] });
+  const agent = await createAgent(server.id, "sparse-reader", { runtime: "codex", creatorType: "user", creatorId: owner.id });
+  await addAgent(channel.id, agent.id);
+  const unseen = await createMessage(channel.id, "user", owner.id, "not shown");
+  const shown = await createMessage(channel.id, "user", owner.id, "local check body");
+  await applyAgentModelSeen({ agentId: agent.id, serverId: server.id, channelId: channel.id, seqs: [shown.seq], launchId: "launch-current" });
+  assert.equal(await getAgentLegacyReadCursor(agent.id, channel.id), 0);
+  const facts = await db.select().from(agentMessageBodyReads).where(eq(agentMessageBodyReads.agentId, agent.id));
+  assert.deepEqual(facts.map(f => [f.messageId, f.launchId]), [[shown.id, "launch-current"]]);
+  await applyAgentModelSeen({ agentId: agent.id, serverId: server.id, channelId: channel.id, seqs: [shown.seq, shown.seq, -1, NaN] });
+  assert.equal((await db.select().from(agentMessageBodyReads)).length, 1);
+  assert.ok(unseen.seq < shown.seq);
 });

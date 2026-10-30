@@ -4788,6 +4788,18 @@ export const activitySyncChanges = pgTable("activity_sync_changes", {
   ),
 ]);
 
+// Exact full-body consumption facts are independent of contiguous read cursors.
+// A sparse Local Inbox read must not mark earlier unseen messages as read.
+export const agentMessageBodyReads = pgTable("agent_message_body_reads", {
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  messageId: uuid("message_id").notNull().references(() => messages.id, { onDelete: "cascade" }),
+  launchId: text("launch_id"),
+  seenAt: timestamp("seen_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.agentId, t.messageId] }),
+  index("idx_agent_message_body_reads_message").on(t.messageId),
+]);
+
 // Agent-channel read cursor for agent unread tracking
 export const agentChannelReadCursors = pgTable("agent_channel_read_cursors", {
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),

@@ -2476,7 +2476,7 @@ registerAgentApiRoute("agentContext", async (req, res) => {
       server: { id: server.id, slug: server.slug, name: server.name },
       credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
       prompt,
-      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true },
+      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true, messageBodyReads: true, replyPhases: true },
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -5146,6 +5146,7 @@ async function handleAgentApiMessageSend(
       content,
       attachmentIds,
       replyTo,
+      replyPhase,
       idempotencyKey,
       reconcileOnly,
       continue: deprecatedContinue,
@@ -5330,7 +5331,11 @@ async function handleAgentApiMessageSend(
       throw err;
     }
 
-    let replyMetadata: { kind: "reply"; messageId: string } | undefined;
+    if (replyPhase && !replyTo) {
+      res.status(400).json({ error: "replyPhase requires replyTo", code: "reply_phase_requires_target" });
+      return;
+    }
+    let replyMetadata: { kind: "reply"; messageId: string; phase?: "progress" | "final" } | undefined;
     if (replyTo) {
       const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, replyTo);
       const original = reference.ok ? await messageService.getMessage(reference.messageId) : null;
@@ -5338,7 +5343,7 @@ async function handleAgentApiMessageSend(
         res.status(404).json({ error: "Reply message is not available in this conversation", code: "reply_not_found" });
         return;
       }
-      replyMetadata = { kind: "reply", messageId: original.id };
+      replyMetadata = { kind: "reply", messageId: original.id, ...(replyPhase ? { phase: replyPhase } : {}) };
     }
 
     // Cards (passive AX): the target's channel card (`seenCards.channel`) and

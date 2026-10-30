@@ -85,6 +85,7 @@ const agentApiSendBodyKnownSchema = lazySchema("agentApiSendBodyKnownSchema", ()
   content: z.string().optional(),
   attachmentIds: optionalStringArraySchema,
   replyTo: agentApiReplyToSchema.optional(),
+  replyPhase: z.enum(["progress", "final"]).optional(),
   idempotencyKey: optionalStringSchema,
   reconcileOnly: optionalBooleanSchema,
   continue: optionalBooleanSchema,
@@ -305,6 +306,7 @@ export const agentApiSendResponseSchema = lazySchema("agentApiSendResponseSchema
 interface AgentApiSendBodyKnownFields {
   /** Reply to a message in the same conversation without creating a subthread. */
   replyTo?: string;
+  replyPhase?: "progress" | "final";
   target?: string;
   content?: string;
   attachmentIds?: string[];

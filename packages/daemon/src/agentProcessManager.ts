@@ -894,7 +894,7 @@ interface AgentProcess {
    * the input. Dropped with the process if it ends first: the next start's
    * catch-up sends them again (a duplicate rather than a loss).
    */
-  pendingModelSeen?: AgentMessage[];
+  pendingModelSeen?: Array<{ channel_id: string; seq: number }>;
   gatedSteering: ApmGatedSteeringDecisionState;
 }
 
@@ -2879,6 +2879,18 @@ export class AgentProcessManager {
     };
 
     const active = this.agents.get(agentId);
+    // /events returns full bodies from Local Inbox, possibly with gaps. Queue
+    // exact seqs and report only after this process produces a model event;
+    // the local high-water remains unchanged.
+    if (active && input.source === "agent_api_events_local") {
+      const bodies = input.messages.flatMap(message => {
+        const channelId = message.channel_id ?? message.channelId;
+        return channelId && Number.isSafeInteger(message.seq) && message.seq! > 0
+          && typeof message.content === "string" && !message.third_party_event
+          ? [{ channel_id: channelId, seq: message.seq! }] : [];
+      });
+      active.pendingModelSeen = [...(active.pendingModelSeen ?? []), ...bodies];
+    }
     const removedActive = suppress(active?.inbox);
     const removedStarting = this.startingInboxes.suppressConsumed(agentId, consumed.shouldSuppress);
     this.assertStartPendingDeliveryInvariants("visible-consume");
@@ -9691,7 +9703,7 @@ export class AgentProcessManager {
       && Boolean(message.channel_id)
       && !runtimeProfileNotificationFromMessage(message));
     if (reportable.length === 0) return;
-    ap.pendingModelSeen = [...(ap.pendingModelSeen ?? []), ...reportable];
+    ap.pendingModelSeen = [...(ap.pendingModelSeen ?? []), ...reportable.map(message => ({ channel_id: message.channel_id, seq: message.seq! }))];
   }
 
   /**

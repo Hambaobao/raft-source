@@ -10381,6 +10381,7 @@ export class AgentOrchestrator extends EventEmitter {
                 serverId: agent.serverId ?? null,
                 channelId: item.channelId,
                 seqs: item.seqs,
+                launchId: msg.launchId,
               });
               if (result.outcome === "advanced") advanced += 1;
               else unchanged += 1;
