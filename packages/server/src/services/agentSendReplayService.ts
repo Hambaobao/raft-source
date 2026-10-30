@@ -168,8 +168,8 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
         throw new AgentSendIdempotencyConflictError("target");
       }
       const replyIdentity = (value: unknown) => {
-        const metadata = value as { kind?: string; messageId?: string } | null;
-        return metadata?.kind === "reply" ? JSON.stringify([metadata.messageId]) : null;
+        const metadata = value as { kind?: string; messageId?: string; phase?: string } | null;
+        return metadata?.kind === "reply" ? JSON.stringify([metadata.messageId, metadata.phase ?? null]) : null;
       };
       if (replyIdentity(replayedMessage.actionMetadata) !== replyIdentity(opts.actionMetadata)) {
         throw new AgentSendIdempotencyConflictError("reply");

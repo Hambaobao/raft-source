@@ -14487,3 +14487,20 @@ test("task #1277 (review): a cancelled start's child that survives SIGKILL is re
     unsubscribe();
   }
 });
+
+test("model-seen: Local Inbox check queues sparse bodies until this launch consumes its tool result", async () => {
+  const driver = new FakeCodexDriver({ id: "pi", supportsStdinNotification: true, busyDeliveryMode: "direct" });
+  await withManager(async ({ manager, sent }) => {
+    await serverStart(manager, "agent-1", makeConfig({ runtime: "pi", sessionId: "session-1" }), "launch-1");
+    await flush();
+    const local = makeMessage("body returned by message check", { message_id: "sparse-local", seq: 188 });
+    (manager as any).consumeVisibleMessages("agent-1", { messages: [local], source: "agent_api_events_local" });
+    assert.equal(sent.filter(msg => msg.type === "agent:model-seen").length, 0);
+    emitRuntimeLines(driver, 0, "turn-1", [{ kind: "text", text: "I read it" }, { kind: "turn_end", sessionId: "session-1" }]);
+    await flush();
+    const reports = sent.filter(msg => msg.type === "agent:model-seen") as Array<Extract<MachineToServerMessage, { type: "agent:model-seen" }>>;
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].launchId, "launch-1");
+    assert.deepEqual(reports[0].items, [{ channelId: local.channel_id, seqs: [188] }]);
+  }, { driver });
+});

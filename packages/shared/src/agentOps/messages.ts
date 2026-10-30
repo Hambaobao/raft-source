@@ -342,6 +342,7 @@ const SEND_TRANSPORT_ATTEMPTS = 3;
 
 export interface SendMessageRequest {
   replyTo?: string;
+  replyPhase?: "progress" | "final";
   target: string;
   content: string;
   attachmentIds?: string[];
@@ -380,6 +381,7 @@ const sendMessageFields = {
 
 export const sendMessageRequestSchema = lazySchema("sendMessageRequestSchema", () => requestSchema<SendMessageRequest>()(z.object({
   replyTo: agentApiReplyToSchema.optional(),
+  replyPhase: z.enum(["progress", "final"]).optional(),
   target: raftTargetSchema,
   ...sendMessageFields,
 })));
@@ -600,6 +602,7 @@ export async function sendMessage(
   if (typeof request.content !== "string" || (!request.content.trim() && !(request.attachmentIds?.length))) {
     return failureOutcome(opError("INVALID_REQUEST", { message: "Message content (or an attachment) is required." }));
   }
+  if (request.replyPhase && !request.replyTo) return failureOutcome(opError("INVALID_REQUEST", { message: "replyPhase requires replyTo." }));
   const idempotencyKey = request.idempotencyKey?.trim() || crypto.randomUUID();
   if (frontier && options.threadTargetCheck === true && request.targetConfirmed !== true) {
     const mismatch = detectThreadTargetMismatch(request.target, frontier.latestThreadRead(request.target), frontier.readOrder(request.target));
@@ -611,7 +614,7 @@ export async function sendMessage(
     ? { ...(request.seen.upToSeq === undefined ? {} : { seenUpToSeq: request.seen.upToSeq }), seenExactSeqs: request.seen.exactSeqs ?? [] }
     : frontier?.attestation(request.target) ?? { seenExactSeqs: [] };
   const body: AgentApiSendV2Body = {
-    ...(request.replyTo ? { replyTo: request.replyTo } : {}),
+    ...(request.replyTo ? { replyTo: request.replyTo, ...(request.replyPhase ? { replyPhase: request.replyPhase } : {}) } : {}),
     target: request.target,
     content: request.content,
     ...(request.attachmentIds?.length ? { attachmentIds: request.attachmentIds } : {}),

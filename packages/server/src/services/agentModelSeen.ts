@@ -1,7 +1,7 @@
-import { and, asc, eq, gt, lte, ne, or } from "drizzle-orm";
+import { and, asc, eq, gt, lte, ne, or, inArray } from "drizzle-orm";
 
 import { getDb } from "../db";
-import { messages } from "../db/schema";
+import { messages, agentMessageBodyReads } from "../db/schema";
 import * as channelService from "./channelService";
 import { READ_POSITION_SETTLE_MS } from "./readPositionSettle";
 
@@ -48,6 +48,7 @@ export async function applyAgentModelSeen(input: {
   serverId: string | null;
   channelId: string;
   seqs: readonly number[];
+  launchId?: string;
 }, options: ApplyAgentModelSeenOptions = {}): Promise<AgentModelSeenOutcome> {
   const { agentId, channelId } = input;
   // The conversation must belong to the agent's own server before anything is
@@ -59,16 +60,26 @@ export async function applyAgentModelSeen(input: {
   if (!await channelService.canAgentAccessChannel(channelId, agentId)) {
     return { outcome: "unchanged", reason: "no_access" };
   }
+  const exactSeqs = [...new Set(input.seqs.filter(seq => Number.isSafeInteger(seq) && seq > 0))].slice(0, MAX_SEQS_PER_ITEM);
+  const storageChannelId = await resolveStorageChannelId(channel, input.serverId);
+  if (exactSeqs.length) {
+    const shown = await getDb().select({ id: messages.id }).from(messages).where(and(
+      eq(messages.channelId, storageChannelId), inArray(messages.seq, exactSeqs),
+      or(ne(messages.senderType, "agent"), ne(messages.senderId, agentId)),
+    ));
+    if (shown.length) await getDb().insert(agentMessageBodyReads).values(shown.map(message => ({
+      agentId, messageId: message.id, launchId: input.launchId ?? null,
+    }))).onConflictDoNothing();
+  }
   const prior = Math.max(0, Number(await channelService.getAgentLegacyReadCursor(agentId, channelId)) || 0);
   const reported = new Set(
-    input.seqs.filter((seq) => Number.isInteger(seq) && seq > prior).slice(0, MAX_SEQS_PER_ITEM),
+    exactSeqs.filter((seq) => seq > prior),
   );
   if (reported.size === 0) return { outcome: "unchanged", reason: "not_after_read_position" };
   const maxReported = Math.max(...reported);
 
   // Joint conversations keep their rows under the canonical channel; the read
   // position stays keyed by this server's projection (as history reads do).
-  const storageChannelId = await resolveStorageChannelId(channel, input.serverId);
   const rows = await getDb()
     .select({ seq: messages.seq, createdAt: messages.createdAt })
     .from(messages)

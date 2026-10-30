@@ -88,6 +88,7 @@ export {
 
 interface SendOpts extends ReviewerIsolationOpts {
   replyTo?: string;
+  replyPhase?: "progress" | "final";
   target: string;
   content?: string;
   attachmentId?: string[];
@@ -349,10 +350,10 @@ export function rejectArgContent(positionalContent: string[], opts: Pick<SendOpt
 }
 
 export function validateDraftSendFlags(
-  opts: Pick<SendOpts, "sendDraft" | "discardDraft" | "expectedDraftKey" | "anyway" | "attachmentId" | "mention" | "replyTo">,
+  opts: Pick<SendOpts, "sendDraft" | "discardDraft" | "expectedDraftKey" | "anyway" | "attachmentId" | "mention" | "replyTo" | "replyPhase">,
 ): void {
-  if ((opts.sendDraft || opts.discardDraft) && opts.replyTo !== undefined) {
-    throw new SendContentError("REPLY_DRAFT_OVERRIDE", "Reply routing is saved with the draft. Resume it without --reply-to, or start a new send.");
+  if ((opts.sendDraft || opts.discardDraft) && (opts.replyTo !== undefined || opts.replyPhase !== undefined)) {
+    throw new SendContentError("REPLY_DRAFT_OVERRIDE", "Reply routing is saved with the draft. Resume it without --reply-to/--reply-phase, or start a new send.");
   }
   if (opts.discardDraft && opts.sendDraft) {
     throw new SendContentError(
@@ -689,6 +690,10 @@ async function handleMessageSend(
     if (err instanceof SendContentError) throw cliError(err.code, err.message, { cause: err });
     throw err;
   }
+  if (opts.replyPhase !== undefined && (!["progress", "final"].includes(opts.replyPhase) || !opts.replyTo)) {
+    throw cliError("INVALID_REPLY_PHASE", "--reply-phase must be progress or final and requires --reply-to.");
+  }
+  let outgoingReplyPhase = opts.replyPhase;
   let outgoingReplyTo: string | undefined;
   if (opts.replyTo !== undefined) {
     const parsed = agentApiReplyToSchema.safeParse(opts.replyTo);
@@ -802,6 +807,7 @@ async function handleMessageSend(
       );
     }
     outgoingReplyTo = savedDraft.replyTo;
+    outgoingReplyPhase = savedDraft.replyPhase;
     outgoingContent = savedDraft.content;
     outgoingAttachmentIds = savedDraft.attachmentIds;
     outgoingMentions = explicitMentions.length > 0 ? explicitMentions : (savedDraft.mentions ?? []);
@@ -814,7 +820,7 @@ async function handleMessageSend(
         ...savedDraft,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo, ...(outgoingReplyPhase ? { replyPhase: outgoingReplyPhase } : {}) } : {}),
       });
     }
     setFailureDraftSaved(true);
@@ -852,7 +858,7 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo, ...(outgoingReplyPhase ? { replyPhase: outgoingReplyPhase } : {}) } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount,
         seenUpToSeq,
@@ -897,7 +903,7 @@ async function handleMessageSend(
   const body: AgentApiSendV2Body = {
     target,
     content: outgoingContent,
-    ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+    ...(outgoingReplyTo ? { replyTo: outgoingReplyTo, ...(outgoingReplyPhase ? { replyPhase: outgoingReplyPhase } : {}) } : {}),
     idempotencyKey,
     draftReholdCount: previousDraftReholdCount,
   };
@@ -944,7 +950,7 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo, ...(outgoingReplyPhase ? { replyPhase: outgoingReplyPhase } : {}) } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount,
         seenUpToSeq,
@@ -1086,7 +1092,7 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo, ...(outgoingReplyPhase ? { replyPhase: outgoingReplyPhase } : {}) } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount + 1,
         // A hold for the card alone showed no messages: keep what was attested.
@@ -1310,6 +1316,7 @@ export const messageSendCommand = defineCommand(
     options: [
       { flags: "--target <target>", description: "Target: '#channel', 'dm:@peer', '#channel:shortid', 'dm:@peer:shortid' (a thread: shortid is its root message's msg=, as in replyTarget)" },
       PEER_KIND_OPTION,
+      { flags: "--reply-phase <progress|final>", description: "With --reply-to: progress keeps the request open; final marks this answer as the completed response to that input. Use progress for acknowledgments or while awaiting collaborators, final only when ready to answer. Omitted means unspecified, never completion. Saved with held drafts." },
       { flags: "--reply-to <message-id>", description: "Reply to this message in the same --target without creating a subthread. Use the msg ID of the person you are answering; replies to teammates should name their message instead. Routing is saved with held drafts." },
       {
         flags: "--send-draft",

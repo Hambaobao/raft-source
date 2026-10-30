@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { and, asc, eq, gt, isNull, or, sql, inArray } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { agents, users, serverMembers, messages, agentChannelReadCursors, messageMentions } from "../db/schema";
+import { agents, users, serverMembers, messages, agentChannelReadCursors, agentMessageBodyReads, messageMentions } from "../db/schema";
 import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
@@ -139,10 +139,12 @@ export async function externalDmReplies(req: Request, res: Response) {
       )).orderBy(asc(messages.seq)).limit(100);
     const [cursor] = await db.select({ seq: agentChannelReadCursors.lastReadSeq }).from(agentChannelReadCursors)
       .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, origin.channelId)));
+    const [bodyRead] = await db.select({ messageId: agentMessageBodyReads.messageId }).from(agentMessageBodyReads)
+      .where(and(eq(agentMessageBodyReads.agentId, agent.id), eq(agentMessageBodyReads.messageId, origin.id)));
     // Native unmentioned DMs have no mention ACK. Name the actual signal;
     // never present persistence or online/idle status as a runtime receipt.
     res.json({ messageId: origin.id, channelId: origin.channelId, recipientId: user.id, messages: await externalReplyPresentation(replies, user.id), superseded: Boolean(nextInput),
-      delivery: { targetHandle: agent.name, outcome: cursor && cursor.seq >= origin.seq ? "read" : "pending", signal: "read_cursor" } });
+      delivery: { targetHandle: agent.name, outcome: bodyRead || (cursor && cursor.seq >= origin.seq) ? "read" : "pending", signal: bodyRead ? "message_body_read" : "read_cursor" } });
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to read external DM replies", logPrefix: "external-dm.replies", err }); }
 }
 

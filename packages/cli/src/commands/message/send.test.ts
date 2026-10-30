@@ -3461,18 +3461,29 @@ test("native in-conversation reply survives a held draft and its retry", async (
     { ok: true, status: 200, error: null, data: { ok: true, state: "held", heldMessages: [], newMessageCount: 0, shownMessageCount: 0, omittedMessageCount: 0, seenUpToSeq: 0 } },
     { ok: true, status: 200, error: null, data: { ok: true, state: "sent", messageId: "reply" } },
   ]);
-  await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", replyTo: ATTACHMENT_A }), /Message held as draft/);
+  await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", replyTo: ATTACHMENT_A, replyPhase: "final" }), /Message held as draft/);
   assert.equal(h.bodies[0]!.replyTo, ATTACHMENT_A);
+  assert.equal(h.bodies[0]!.replyPhase, "final");
   assert.equal(h.bodies[0]!.content, "one logical send\n");
   assert.equal(getSavedDraft("agent-send-reconcile", "#room")?.replyTo, ATTACHMENT_A);
   h.ctx.io.stdin = Readable.from([]);
   await messageSendCommand.handler(h.ctx, [], { target: "#room", sendDraft: true });
   assert.equal(h.bodies[1]!.replyTo, ATTACHMENT_A);
+  assert.equal(h.bodies[1]!.replyPhase, "final");
   assert.equal(h.bodies[1]!.idempotencyKey, h.bodies[0]!.idempotencyKey);
 });
 
 test("native reply flags reject invalid references and draft retargeting before any request", async () => {
   for (const opts of [{ replyTo: "bad-id" }, { sendDraft: true, replyTo: ATTACHMENT_B }, { discardDraft: true, replyTo: ATTACHMENT_A }]) {
+    const h = ambiguousSendHarness([]);
+    await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", ...opts }));
+    assert.equal(h.bodies.length, 0);
+  }
+});
+
+
+test("reply phase rejects missing targets, invalid phases and draft overrides without sending", async () => {
+  for (const opts of [{ replyPhase: "final" }, { replyTo: ATTACHMENT_A, replyPhase: "done" }, { sendDraft: true, replyPhase: "progress" }]) {
     const h = ambiguousSendHarness([]);
     await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", ...opts }));
     assert.equal(h.bodies.length, 0);

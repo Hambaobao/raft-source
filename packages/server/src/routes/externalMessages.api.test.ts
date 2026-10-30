@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { applyAgentModelSeen } from "../services/agentModelSeen";
 import { randomUUID } from "node:crypto";
 import { afterEach } from "vitest";
 import { and, eq } from "drizzle-orm";
@@ -245,4 +246,28 @@ test("topic stream advances across internal-only pages and resumes without dupli
   assert.equal(second.hasMore,false);assert.equal(second.messages.length,1);assert.ok(second.nextSeq>first.nextSeq);
   const third=await (await h.topicReplies(origin.messageId,`&after=${second.nextSeq}`)).json();
   assert.deepEqual(third.messages,[]);assert.equal(third.nextSeq,second.nextSeq);
+});
+
+test("DM body consumption is visible without advancing the contiguous cursor", async ({ db, app }) => {
+  const h = await fixture(db, app.baseUrl);
+  const origin = await (await h.send()).json();
+  assert.equal((await (await h.replies(origin.messageId)).json()).delivery.outcome, "pending");
+  await applyAgentModelSeen({ agentId: h.agent.id, serverId: h.server.id, channelId: origin.channelId, seqs: [origin.messageSeq] });
+  const result = await (await h.replies(origin.messageId)).json();
+  assert.equal(result.delivery.outcome, "read");
+  assert.equal(result.delivery.signal, "message_body_read");
+});
+test("topic read facts are exact and scoped to its bound human, agent and conversation", async ({ db, app }) => {
+  const h = await topicFixture(db, app.baseUrl);
+  const first = await (await h.topicSend()).json();
+  const second = await (await h.topicSend()).json();
+  const differentScope = await (await h.topicSend({ externalConversationId: "another-topic" })).json();
+  await applyAgentModelSeen({ agentId: h.agent.id, serverId: h.server.id, channelId: h.channel.id, seqs: [second.messageSeq, differentScope.messageSeq] });
+  const result = await (await h.topicReplies(first.messageId, "&readMessageIds=" + [first.messageId, second.messageId, differentScope.messageId, randomUUID()].join(","))).json();
+  assert.equal(result.delivery.signal, "message_body_read_or_cursor");
+  assert.deepEqual(result.delivery.readMessageIds, [second.messageId]);
+  assert.ok(result.delivery.lastReadSeq < first.messageSeq);
+  assert.equal((await h.topicReplies(first.messageId, "&readMessageIds=bad")).status, 400);
+  process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = "[]";
+  assert.equal((await h.topicReplies(first.messageId, "&readMessageIds=" + second.messageId)).status, 404);
 });
