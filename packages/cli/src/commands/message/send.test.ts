@@ -3454,3 +3454,27 @@ test("5xx guidance is only attached when a draft was actually saved", () => {
   assert.ok(notSaved instanceof CliError);
   assert.equal(notSaved.suggestedNextAction, undefined);
 });
+
+test("external reply routing survives a held draft and its retry without body markers", async () => {
+  process.env.SLOCK_CLI_DRAFT_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "raft-external-reply-"));
+  const h = ambiguousSendHarness([
+    { ok: true, status: 200, error: null, data: { ok: true, state: "held", heldMessages: [], newMessageCount: 0, shownMessageCount: 0, omittedMessageCount: 0, seenUpToSeq: 0 } },
+    { ok: true, status: 200, error: null, data: { ok: true, state: "sent", messageId: "reply" } },
+  ]);
+  await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", externalReplyTo: ATTACHMENT_A, externalReplyTitle: " Price " }), /Message held as draft/);
+  assert.deepEqual(h.bodies[0]!.externalReply, { messageId: ATTACHMENT_A, title: "Price" });
+  assert.equal(h.bodies[0]!.content, "one logical send\n");
+  assert.deepEqual(getSavedDraft("agent-send-reconcile", "#room")?.externalReply, h.bodies[0]!.externalReply);
+  h.ctx.io.stdin = Readable.from([]);
+  await messageSendCommand.handler(h.ctx, [], { target: "#room", sendDraft: true });
+  assert.deepEqual(h.bodies[1]!.externalReply, h.bodies[0]!.externalReply);
+  assert.equal(h.bodies[1]!.idempotencyKey, h.bodies[0]!.idempotencyKey);
+});
+
+test("external reply flags reject invalid references and draft retargeting before any request", async () => {
+  for (const opts of [{ externalReplyTo: "bad-id" }, { externalReplyTitle: "title" }, { externalReplyTo: ATTACHMENT_A, externalReplyTitle: " " }, { sendDraft: true, externalReplyTo: ATTACHMENT_B }, { discardDraft: true, externalReplyTitle: "title" }]) {
+    const h = ambiguousSendHarness([]);
+    await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", ...opts }));
+    assert.equal(h.bodies.length, 0);
+  }
+});

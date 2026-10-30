@@ -9652,6 +9652,7 @@ export async function broadcastAndDeliver(
           senderId,
           content,
           agentSendKey,
+          actionMetadata,
           attachmentIds,
           rejectMismatchedReplay: opts.rejectMismatchedAgentSendReplay === true,
           beforeInsert: tx && useAtomicMessageTransaction

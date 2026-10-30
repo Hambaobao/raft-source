@@ -3,12 +3,13 @@
 // One draft per target, kept for LOCAL_DRAFT_TTL_MINUTES, with a rehold
 // counter and the seen snapshot (sparse exact seqs) it was held with.
 
-import { agentApiStructuredMentionSchema, type AgentApiStructuredMention } from "../../agentApiMessageContract";
+import { agentApiExternalReplySchema, agentApiStructuredMentionSchema, type AgentApiExternalReply, type AgentApiStructuredMention } from "../../agentApiMessageContract";
 import type { CommandStateStore, MaybePromise } from "./store";
 import { normalizeExactSeqs } from "./consumedSeqs";
 import { andThen } from "./maybe";
 
 export interface SavedDraft {
+  externalReply?: AgentApiExternalReply;
   content: string;
   attachmentIds: string[];
   idempotencyKey?: string;
@@ -45,6 +46,7 @@ export function lookupSavedDraft(store: CommandStateStore, target: string, now: 
         return parsed.success ? [parsed.data] : [];
       })
       : undefined;
+    const externalReply = draft.externalReply === undefined ? undefined : agentApiExternalReplySchema.parse(draft.externalReply);
     const savedAt = Number.isFinite(draft.savedAt) ? draft.savedAt : now();
     const reholdCount = Number.isFinite(draft.reholdCount) ? draft.reholdCount : 0;
     const seenUpToSeq = Number.isFinite(draft.seenUpToSeq) ? draft.seenUpToSeq : undefined;
@@ -72,6 +74,7 @@ export function lookupSavedDraft(store: CommandStateStore, target: string, now: 
       draft: {
         content: draft.content,
         attachmentIds,
+        ...(externalReply ? { externalReply } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
         ...(mentions && mentions.length > 0 ? { mentions } : {}),
         savedAt,
@@ -92,6 +95,7 @@ export function setSavedDraft(store: CommandStateStore, target: string, draft: S
   return store.writeDraft(target, {
     content: draft.content,
     attachmentIds: draft.attachmentIds,
+    ...(draft.externalReply ? { externalReply: draft.externalReply } : {}),
     ...(draft.idempotencyKey ? { idempotencyKey: draft.idempotencyKey } : {}),
     ...(draft.mentions && draft.mentions.length > 0 ? { mentions: draft.mentions } : {}),
     savedAt: draft.savedAt,

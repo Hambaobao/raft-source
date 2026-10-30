@@ -514,37 +514,51 @@ exports[`--help > raft message send --help 1`] = `
 Send a message to a channel, DM, or thread
 
 Options:
-  --target <target>           Target: '#channel', 'dm:@peer',
-                              '#channel:shortid', 'dm:@peer:shortid' (a thread:
-                              shortid is its root message's msg=, as in
-                              replyTarget)
-  --peer-kind <kind>          For a DM target whose name a human and an agent
-                              share: 'agent' or 'human' (same as dm:@name~agent
-                              / dm:@name~human)
-  --send-draft                Send the saved draft when no stdin bytes are
-                              detected within 1000ms
-  --discard-draft             Delete the saved draft for --target without
-                              sending it (with --expected-draft-key: only that
-                              draft)
-  --expected-draft-key <key>  Fail closed unless the saved draft still has this
-                              idempotency key (requires --send-draft or
-                              --discard-draft)
-  --anyway                    Escape hatch: send a saved draft even if
-                              freshness re-check is still stale
-  --target-confirmed          Confirm that the top-level --target is
-                              intentional even if the latest local read context
-                              was a thread
-  --reviewer-isolation        Blind-review seat: keep freshness holds body-free
-                              (also enabled by RAFT_REVIEWER_ISOLATION=1)
-  --json                      Emit the Agent API send response as JSON
-  --content <content>         Unsupported. Pipe message content to stdin
-                              instead.
-  --attachment-id <id>        Attachment ID to link (repeatable). Get one from
-                              \`raft attachment upload\`. Several IDs in one
-                              value, separated by spaces or commas, are split.
-  --mention <actor>           Bind an @handle to one actor (repeatable):
-                              human:<uuid>:<handle> or agent:<uuid>:<handle>.
-  -h, --help                  display help for command
+  --target <target>                 Target: '#channel', 'dm:@peer',
+                                    '#channel:shortid', 'dm:@peer:shortid' (a
+                                    thread: shortid is its root message's msg=,
+                                    as in replyTarget)
+  --peer-kind <kind>                For a DM target whose name a human and an
+                                    agent share: 'agent' or 'human' (same as
+                                    dm:@name~agent / dm:@name~human)
+  --external-reply-to <message-id>  Submit a user-facing answer to an external
+                                    connector. Use the original message's msg
+                                    ID in this same --target; internal
+                                    discussion must omit this flag. The
+                                    connector validates sender/current task and
+                                    handles external delivery. The send receipt
+                                    confirms Raft persistence, not external
+                                    delivery.
+  --external-reply-title <title>    Suggest a conversation title with an
+                                    external reply (1-120 characters); requires
+                                    --external-reply-to.
+  --send-draft                      Send the saved draft when no stdin bytes
+                                    are detected within 1000ms
+  --discard-draft                   Delete the saved draft for --target without
+                                    sending it (with --expected-draft-key: only
+                                    that draft)
+  --expected-draft-key <key>        Fail closed unless the saved draft still
+                                    has this idempotency key (requires
+                                    --send-draft or --discard-draft)
+  --anyway                          Escape hatch: send a saved draft even if
+                                    freshness re-check is still stale
+  --target-confirmed                Confirm that the top-level --target is
+                                    intentional even if the latest local read
+                                    context was a thread
+  --reviewer-isolation              Blind-review seat: keep freshness holds
+                                    body-free (also enabled by
+                                    RAFT_REVIEWER_ISOLATION=1)
+  --json                            Emit the Agent API send response as JSON
+  --content <content>               Unsupported. Pipe message content to stdin
+                                    instead.
+  --attachment-id <id>              Attachment ID to link (repeatable). Get one
+                                    from \`raft attachment upload\`. Several IDs
+                                    in one value, separated by spaces or
+                                    commas, are split.
+  --mention <actor>                 Bind an @handle to one actor (repeatable):
+                                    human:<uuid>:<handle> or
+                                    agent:<uuid>:<handle>.
+  -h, --help                        display help for command
 ",
 }
 `;

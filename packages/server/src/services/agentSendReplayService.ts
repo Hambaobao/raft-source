@@ -43,9 +43,9 @@ export class AgentSendIdempotencyConflictError extends Error {
   readonly status = 409 as const;
   readonly code = "idempotency_key_reused" as const;
   readonly suggestedNextAction = "use a new idempotencyKey for different content";
-  readonly mismatch: "target" | "content" | "attachments";
+  readonly mismatch: "target" | "content" | "attachments" | "external_reply";
 
-  constructor(mismatch: "target" | "content" | "attachments") {
+  constructor(mismatch: "target" | "content" | "attachments" | "external_reply") {
     super(`idempotencyKey was already used for a message with a different ${mismatch}; use a new idempotencyKey for different content`);
     this.name = "AgentSendIdempotencyConflictError";
     this.mismatch = mismatch;
@@ -78,6 +78,7 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
   content: string;
   agentSendKey: string;
   attachmentIds?: string[];
+  actionMetadata?: unknown | null;
   /**
    * Agent-facing sends (`idempotencyKey`): a replay whose target, content or
    * ordered attachment set differs from the committed message is refused with
@@ -116,6 +117,7 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
         agentSendKey,
         content,
         messageType: "chat",
+        actionMetadata: opts.actionMetadata ?? null,
         searchText: buildSearchText(content),
       })
       .onConflictDoNothing()
@@ -164,6 +166,13 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
     if (opts.rejectMismatchedReplay) {
       if (replayedMessage.channelId !== channelId) {
         throw new AgentSendIdempotencyConflictError("target");
+      }
+      const replyIdentity = (value: unknown) => {
+        const metadata = value as { kind?: string; messageId?: string; title?: string } | null;
+        return metadata?.kind === "external-reply" ? JSON.stringify([metadata.messageId, metadata.title ?? null]) : null;
+      };
+      if (replyIdentity(replayedMessage.actionMetadata) !== replyIdentity(opts.actionMetadata)) {
+        throw new AgentSendIdempotencyConflictError("external_reply");
       }
       if (replayedMessage.content !== content) {
         throw new AgentSendIdempotencyConflictError("content");

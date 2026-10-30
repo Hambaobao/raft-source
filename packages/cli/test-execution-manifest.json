@@ -4,7 +4,7 @@
   "runner": "vitest run",
   "testFileGlob": "src/**/*.test.ts",
   "fileCount": 127,
-  "total": 1211,
+  "total": 1213,
   "files": [
     {
       "file": "src/agentApiNoBypass.test.ts",
@@ -2690,7 +2690,7 @@
     },
     {
       "file": "src/commands/message/send.test.ts",
-      "count": 105,
+      "count": 107,
       "cases": [
         {
           "name": "resolveSendContent reads multiline content from stdin"
@@ -3006,6 +3006,12 @@
         },
         {
           "name": "5xx guidance is only attached when a draft was actually saved"
+        },
+        {
+          "name": "external reply routing survives a held draft and its retry without body markers"
+        },
+        {
+          "name": "external reply flags reject invalid references and draft retargeting before any request"
         }
       ]
     },

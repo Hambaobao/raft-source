@@ -78,10 +78,23 @@ const agentApiSeenCardsSchema = lazySchema("agentApiSeenCardsSchema", () => z.ob
   peer: z.string().min(1).nullable().optional(),
 }));
 
+/** A deliberate user-facing answer, linked to its original message in the same conversation. */
+export interface AgentApiExternalReply {
+  messageId: string;
+  /** Optional suggested conversation title, consumed by the external connector. */
+  title?: string;
+}
+
+export const agentApiExternalReplySchema = lazySchema("agentApiExternalReplySchema", () => z.object({
+  messageId: z.string().regex(/^(?:[0-9a-f]{8}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i),
+  title: z.string().trim().min(1).max(120).optional(),
+}).strict());
+
 const agentApiSendBodyKnownSchema = lazySchema("agentApiSendBodyKnownSchema", () => z.object({
   target: z.string().optional(),
   content: z.string().optional(),
   attachmentIds: optionalStringArraySchema,
+  externalReply: agentApiExternalReplySchema.optional(),
   idempotencyKey: optionalStringSchema,
   reconcileOnly: optionalBooleanSchema,
   continue: optionalBooleanSchema,
@@ -300,6 +313,7 @@ export const agentApiSendResponseSchema = lazySchema("agentApiSendResponseSchema
 // The passthrough index signature matches the runtime schema's forward-
 // compatible treatment of unknown fields.
 interface AgentApiSendBodyKnownFields {
+  externalReply?: AgentApiExternalReply;
   target?: string;
   content?: string;
   attachmentIds?: string[];
