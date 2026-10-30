@@ -1,3 +1,4 @@
+import type { MessageRelations } from "../services/messageRelations";
 import { externalTopicSend, externalTopicMessages } from "./externalTopicMessages";
 import { externalDmBinding, externalDmSend, externalDmReplies } from "./externalMessages";
 import { raftbenchContextQuerySchema, raftbenchReportSchema } from "@botiverse/raft-shared";
@@ -2476,7 +2477,7 @@ registerAgentApiRoute("agentContext", async (req, res) => {
       server: { id: server.id, slug: server.slug, name: server.name },
       credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
       prompt,
-      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true, messageBodyReads: true, replyPhases: true },
+      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true, messageBodyReads: true, messageCompletions: true, externalDmStream: true },
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -5146,7 +5147,7 @@ async function handleAgentApiMessageSend(
       content,
       attachmentIds,
       replyTo,
-      replyPhase,
+      completedInputMessageIds,
       idempotencyKey,
       reconcileOnly,
       continue: deprecatedContinue,
@@ -5331,11 +5332,12 @@ async function handleAgentApiMessageSend(
       throw err;
     }
 
-    if (replyPhase && !replyTo) {
-      res.status(400).json({ error: "replyPhase requires replyTo", code: "reply_phase_requires_target" });
+    // Retired fields fail visibly; silently dropping completion could strand feedback.
+    if (Object.prototype.hasOwnProperty.call(req.body, "replyPhase")) {
+      res.status(400).json({ error: "Use completedInputMessageIds independently of replyTo", code: "reply_phase_removed" });
       return;
     }
-    let replyMetadata: { kind: "reply"; messageId: string; phase?: "progress" | "final" } | undefined;
+    const replyMetadata: MessageRelations = { kind: "message" };
     if (replyTo) {
       const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, replyTo);
       const original = reference.ok ? await messageService.getMessage(reference.messageId) : null;
@@ -5343,8 +5345,22 @@ async function handleAgentApiMessageSend(
         res.status(404).json({ error: "Reply message is not available in this conversation", code: "reply_not_found" });
         return;
       }
-      replyMetadata = { kind: "reply", messageId: original.id, ...(replyPhase ? { phase: replyPhase } : {}) };
+      replyMetadata.replyTo = original.id;
     }
+    const completedIds = new Set<string>();
+    for (const id of completedInputMessageIds ?? []) {
+      const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, id);
+      const original = reference.ok ? await messageService.getMessage(reference.messageId) : null;
+      const source = original?.actionMetadata as Record<string, unknown> | null;
+      if (!original || original.channelId !== resolved.channelId || original.senderType !== "user"
+        || original.messageType !== "chat"
+        || ((source?.kind === "external-dm" || source?.kind === "external-topic") && source.recipientAgentId !== actingAgentId)) {
+        res.status(404).json({ error: "Input is not available for completion in this conversation", code: "completion_not_found" });
+        return;
+      }
+      completedIds.add(original.id);
+    }
+    if (completedIds.size) replyMetadata.completedInputMessageIds = [...completedIds].sort();
 
     // Cards (passive AX): the target's channel card (`seenCards.channel`) and
     // a DM target's peer card (`seenCards.peer`), each only for a client that
@@ -5509,7 +5525,7 @@ async function handleAgentApiMessageSend(
         senderId: actingAgentId,
         senderName: agent.displayName || agent.name || "Agent",
         content,
-        ...(replyMetadata ? { actionMetadata: replyMetadata } : {}),
+        ...(replyMetadata.replyTo || replyMetadata.completedInputMessageIds?.length ? { actionMetadata: replyMetadata } : {}),
         mentions,
         mentionContract: routeKey === "messageSendV2" ? "v2" : "v1",
         attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [],

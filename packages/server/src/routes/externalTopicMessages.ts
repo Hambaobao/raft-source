@@ -5,12 +5,12 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { and, asc, eq, gt, inArray } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { channelAgents, messages, messageMentions, agentChannelReadCursors, agentMessageBodyReads } from "../db/schema";
+import { channelAgents, messages, messageMentions } from "../db/schema";
 import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
-import { externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema, externalReplyPresentation } from "./externalMessages";
+import { externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema, externalReplyPresentation, externalReplyRelations, externalInputReads } from "./externalMessages";
 import { sendJsonServerError } from "./errorResponse";
 
 const conversationId = z.string().min(1).max(512);
@@ -108,43 +108,12 @@ export async function externalTopicMessages(req: Request, res: Response) {
       .where(and(inArray(messageMentions.messageId, candidates.map(m => m.id)), eq(messageMentions.targetType, "user"),
         eq(messageMentions.targetId, user.id), eq(messageMentions.confidence, "exact"), eq(messageMentions.notifiableAtSend, true))) : [];
     const mentioned = new Set(mentions.map(m => m.messageId));
-    const replyId = (m: typeof candidates[number]): string | null => {
-      const metadata = m.actionMetadata as { kind?: string; messageId?: string } | null;
-      return metadata?.kind === "reply" && z.string().uuid().safeParse(metadata.messageId).success ? metadata.messageId! : null;
-    };
-    const replyIds = [...new Set(candidates.map(replyId).filter((id): id is string => id !== null))];
-    const originals = replyIds.length ? await db.select({ id: messages.id, actionMetadata: messages.actionMetadata }).from(messages).where(and(
-      inArray(messages.id, replyIds), eq(messages.channelId, channel.id), eq(messages.senderType, "user"),
-      eq(messages.senderId, user.id), eq(messages.messageType, "chat"))) : [];
-    const humanReplies = new Map(originals.map(m => [m.id, m]));
-    const addressed = candidates.flatMap(message => {
-      const id = replyId(message);
-      const recipientMentioned = mentioned.has(message.id);
-      const recipientReplyTo = id && humanReplies.has(id) ? id : null;
-      const source = recipientReplyTo ? humanReplies.get(recipientReplyTo)?.actionMetadata as Record<string, unknown> | null : null;
-      const recipientExternalMessageId = source?.kind === "external-topic" && source.bindingId === binding.id
-        && source.bridgeAgentId === binding.bridgeAgentId && source.recipientAgentId === agent.id
-        && source.externalUserId === binding.externalUserId && source.externalConversationId === parsed.data.externalConversationId
-        && typeof source.externalMessageId === "string" ? source.externalMessageId : null;
-      return recipientMentioned || recipientReplyTo ? [{ ...message, recipientMentioned, recipientReplyTo, recipientExternalMessageId }] : [];
-    });
-    const [cursor] = await db.select({ seq: agentChannelReadCursors.lastReadSeq }).from(agentChannelReadCursors)
-      .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, channel.id)));
-    // Only return exact facts for requested inputs belonging to this binding,
-    // human and conversation; never expose another channel's consumption.
-    const requested = parsed.data.readMessageIds ?? [];
-    const readInputs = requested.length ? await db.select({ id: messages.id, metadata: messages.actionMetadata })
-      .from(messages).innerJoin(agentMessageBodyReads, eq(agentMessageBodyReads.messageId, messages.id))
-      .where(and(eq(agentMessageBodyReads.agentId, agent.id), eq(messages.channelId, channel.id),
-        eq(messages.senderType, "user"), eq(messages.senderId, user.id), inArray(messages.id, requested))) : [];
-    const readMessageIds = readInputs.filter(input => {
-      const source = input.metadata as Record<string, unknown> | null;
-      return source?.kind === "external-topic" && source.bindingId === binding.id
-        && source.bridgeAgentId === binding.bridgeAgentId && source.recipientAgentId === agent.id
-        && source.externalUserId === binding.externalUserId && source.externalConversationId === parsed.data.externalConversationId;
-    }).map(input => input.id);
+    const related = await externalReplyRelations(candidates, auth, channel.id, parsed.data.externalConversationId);
+    const addressed = related.filter(m => mentioned.has(m.id) || m.recipientReplyTo)
+      .map(m => ({ ...m, recipientMentioned: mentioned.has(m.id) }));
+    const delivery = await externalInputReads(auth, channel.id, parsed.data.readMessageIds ?? [], parsed.data.externalConversationId);
     res.json({ anchorMessageId: origin.id, channelId: channel.id, recipientId: user.id, coordinatorId: agent.id,
-      messages: await externalReplyPresentation(addressed, user.id), nextSeq: batch.at(-1)?.seq ?? after, hasMore: batch.length === 100,
-      delivery: { targetHandle: agent.name, lastReadSeq: cursor?.seq ?? 0, readMessageIds, signal: "message_body_read_or_cursor" } });
+      messages: await externalReplyPresentation(addressed, user.id), nextSeq: batch.at(-1)?.seq ?? after, hasMore: batch.length === 100, delivery });
+
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to read topic messages", logPrefix: "external-topic.messages", err }); }
 }

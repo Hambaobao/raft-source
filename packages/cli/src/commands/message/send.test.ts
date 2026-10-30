@@ -3461,15 +3461,15 @@ test("native in-conversation reply survives a held draft and its retry", async (
     { ok: true, status: 200, error: null, data: { ok: true, state: "held", heldMessages: [], newMessageCount: 0, shownMessageCount: 0, omittedMessageCount: 0, seenUpToSeq: 0 } },
     { ok: true, status: 200, error: null, data: { ok: true, state: "sent", messageId: "reply" } },
   ]);
-  await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", replyTo: ATTACHMENT_A, replyPhase: "final" }), /Message held as draft/);
+  await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", replyTo: ATTACHMENT_A, complete: [ATTACHMENT_A, ATTACHMENT_B] }), /Message held as draft/);
   assert.equal(h.bodies[0]!.replyTo, ATTACHMENT_A);
-  assert.equal(h.bodies[0]!.replyPhase, "final");
+  assert.deepEqual(h.bodies[0]!.completedInputMessageIds, [ATTACHMENT_A, ATTACHMENT_B]);
   assert.equal(h.bodies[0]!.content, "one logical send\n");
   assert.equal(getSavedDraft("agent-send-reconcile", "#room")?.replyTo, ATTACHMENT_A);
   h.ctx.io.stdin = Readable.from([]);
   await messageSendCommand.handler(h.ctx, [], { target: "#room", sendDraft: true });
   assert.equal(h.bodies[1]!.replyTo, ATTACHMENT_A);
-  assert.equal(h.bodies[1]!.replyPhase, "final");
+  assert.deepEqual(h.bodies[1]!.completedInputMessageIds, [ATTACHMENT_A, ATTACHMENT_B]);
   assert.equal(h.bodies[1]!.idempotencyKey, h.bodies[0]!.idempotencyKey);
 });
 
@@ -3482,10 +3482,19 @@ test("native reply flags reject invalid references and draft retargeting before 
 });
 
 
-test("reply phase rejects missing targets, invalid phases and draft overrides without sending", async () => {
-  for (const opts of [{ replyPhase: "final" }, { replyTo: ATTACHMENT_A, replyPhase: "done" }, { sendDraft: true, replyPhase: "progress" }]) {
+test("completion rejects invalid references and draft overrides before sending", async () => {
+  for (const opts of [{ complete: ["bad-id"] }, { complete: Array(101).fill(ATTACHMENT_A) }, { sendDraft: true, complete: [ATTACHMENT_A] }, { sendDraft: true, text: "replacement" }]) {
     const h = ambiguousSendHarness([]);
     await assert.rejects(async () => messageSendCommand.handler(h.ctx, [], { target: "#room", ...opts }));
     assert.equal(h.bodies.length, 0);
   }
+});
+
+test("direct text and completion do not require a quotation or stdin", async () => {
+  const h = ambiguousSendHarness([{ ok: true, status: 200, error: null, data: { ok: true, state: "sent", messageId: "answer" } }]);
+  h.ctx.io.stdin = new Readable({ read() { throw new Error("stdin must not be read with --text"); } });
+  await messageSendCommand.handler(h.ctx, [], { target: "#room", text: "plain answer", complete: [ATTACHMENT_A] });
+  assert.equal(h.bodies[0]!.content, "plain answer");
+  assert.equal(h.bodies[0]!.replyTo, undefined);
+  assert.deepEqual(h.bodies[0]!.completedInputMessageIds, [ATTACHMENT_A]);
 });
