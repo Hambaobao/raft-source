@@ -2773,12 +2773,12 @@ async function createOrReplayUserRandomSend(opts: {
         && typeof replayedMessage.actionMetadata._forwardRequestDigest === "string"
         ? replayedMessage.actionMetadata._forwardRequestDigest
         : null;
-      const externalDmReplay = (isRecord(opts.actionMetadata) && opts.actionMetadata.kind === "external-dm")
-        || (isRecord(replayedMessage.actionMetadata) && replayedMessage.actionMetadata.kind === "external-dm");
+      const isExternalInput = (metadata: unknown) => isRecord(metadata) && ["external-dm", "external-topic"].includes(String(metadata.kind));
+      const externalMessageReplay = isExternalInput(opts.actionMetadata) || isExternalInput(replayedMessage.actionMetadata);
       if (
         replayedMessage.channelId !== opts.channelId
         || expectedForwardDigest !== replayedForwardDigest
-        || (externalDmReplay && (replayedMessage.content !== opts.content
+        || (externalMessageReplay && (replayedMessage.content !== opts.content
           || !isDeepStrictEqual(replayedMessage.actionMetadata, opts.actionMetadata)))
       ) {
         throw new UserRandomIdConflictError();
