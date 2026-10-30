@@ -1,7 +1,8 @@
+import { messageRelations } from "../services/messageRelations";
 import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { and, asc, eq, gt, isNull, or, sql, inArray } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, inArray } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { agents, users, serverMembers, messages, agentChannelReadCursors, agentMessageBodyReads, messageMentions } from "../db/schema";
 import * as channelService from "../services/channelService";
@@ -34,6 +35,7 @@ export const externalMessageInputSchema = z.object({
 }).strict();
 export const externalMessageLookupSchema = z.object({
   externalUserId: z.string().min(1).max(256),
+  readMessageIds: z.string().max(3699).transform(value => value.split(",")).pipe(z.array(z.string().uuid()).max(100)).optional(),
   after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
 }).strict();
 
@@ -119,32 +121,20 @@ export async function externalDmReplies(req: Request, res: Response) {
       || !await channelService.canAgentAccessChannel(origin.channelId, agent.id)) { unavailable(res); return; }
     const channel = await channelService.getChannel(origin.channelId);
     if (channel?.type !== "dm" || channel.serverId !== req.serverId) { unavailable(res); return; }
-    // A DM is already a user-facing conversation. Normal Agent messages need
-    // no external reply command. Stop at the next human input so a Web-only
-    // question does not silently become an external conversation. Explicit
-    // source associations distinguish replies to earlier inputs.
-    // Membership/system notices also use senderType=user; only chat inputs supersede.
-    const [nextInput] = await db.select({ seq: messages.seq }).from(messages).where(and(
-      eq(messages.channelId, origin.channelId), eq(messages.senderType, "user"), eq(messages.messageType, "chat"), gt(messages.seq, origin.seq),
-    )).orderBy(asc(messages.seq)).limit(1);
-    const replies = await db.select({ id: messages.id, seq: messages.seq, channelId: messages.channelId,
-      senderId: messages.senderId, senderType: messages.senderType, content: messages.content, actionMetadata: messages.actionMetadata })
-      .from(messages).where(and(eq(messages.channelId, origin.channelId), eq(messages.senderType, "agent"),
-        eq(messages.senderId, agent.id), eq(messages.messageType, "chat"), gt(messages.seq, Math.max(origin.seq, parsed.data.after ?? 0)),
-        or(and(sql`${messages.actionMetadata}->>'kind' = 'reply'`, sql`${messages.actionMetadata}->>'messageId' = ${origin.id}`),
-          and(sql`COALESCE(${messages.actionMetadata}->>'kind', '') <> 'reply'`,
-            sql`NOT EXISTS (SELECT 1 FROM messages later_input
-              WHERE later_input.channel_id = ${origin.channelId} AND later_input.sender_type = 'user' AND later_input.message_type = 'chat'
-              AND later_input.seq > ${origin.seq} AND later_input.seq < ${messages.seq})`)),
-      )).orderBy(asc(messages.seq)).limit(100);
-    const [cursor] = await db.select({ seq: agentChannelReadCursors.lastReadSeq }).from(agentChannelReadCursors)
-      .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, origin.channelId)));
-    const [bodyRead] = await db.select({ messageId: agentMessageBodyReads.messageId }).from(agentMessageBodyReads)
-      .where(and(eq(agentMessageBodyReads.agentId, agent.id), eq(agentMessageBodyReads.messageId, origin.id)));
-    // Native unmentioned DMs have no mention ACK. Name the actual signal;
-    // never present persistence or online/idle status as a runtime receipt.
-    res.json({ messageId: origin.id, channelId: origin.channelId, recipientId: user.id, messages: await externalReplyPresentation(replies, user.id), superseded: Boolean(nextInput),
-      delivery: { targetHandle: agent.name, outcome: bodyRead || (cursor && cursor.seq >= origin.seq) ? "read" : "pending", signal: bodyRead ? "message_body_read" : "read_cursor" } });
+    // An external input anchors a persistent, authorized DM stream. Later
+    // human inputs never reassign old answers or close the conversation.
+    const after = Math.max(origin.seq, parsed.data.after ?? 0);
+    const batch = await db.select({ id: messages.id, seq: messages.seq, channelId: messages.channelId,
+      senderId: messages.senderId, senderType: messages.senderType, content: messages.content,
+      messageType: messages.messageType, actionMetadata: messages.actionMetadata })
+      .from(messages).where(and(eq(messages.channelId, origin.channelId), gt(messages.seq, after)))
+      .orderBy(asc(messages.seq)).limit(100);
+    const replies = batch.filter(m => m.senderType === "agent" && m.senderId === agent.id && m.messageType === "chat");
+    const delivery = await externalInputReads(auth, origin.channelId, parsed.data.readMessageIds ?? []);
+    res.json({ messageId: origin.id, channelId: origin.channelId, recipientId: user.id, coordinatorId: agent.id,
+      messages: await externalReplyPresentation(await externalReplyRelations(replies, auth, origin.channelId), user.id),
+      nextSeq: batch.at(-1)?.seq ?? after, hasMore: batch.length === 100, delivery });
+
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to read external DM replies", logPrefix: "external-dm.replies", err }); }
 }
 
@@ -168,4 +158,61 @@ export async function externalReplyPresentation<T extends { id: string; content:
     }
     return { ...message, recipientMentionPrefix };
   });
+}
+
+
+// Project only references visible in this conversation; completion does not
+// address a recipient. Both DM and channel adapters share these relations.
+export async function externalReplyRelations<T extends { actionMetadata: unknown }>(
+  replies: T[], auth: NonNullable<Awaited<ReturnType<typeof externalMessageAuthority>>>,
+  channelId: string, externalConversationId?: string,
+) {
+  const { binding, user, agent } = auth;
+  const relations = replies.map(m => messageRelations(m.actionMetadata));
+  const ids = [...new Set(relations.flatMap(m => [...(m.replyTo ? [m.replyTo] : []), ...(m.completedInputMessageIds ?? [])]))];
+  const originals = ids.length ? await getDb().select({ id: messages.id, senderType: messages.senderType,
+    senderId: messages.senderId, content: messages.content, metadata: messages.actionMetadata })
+    .from(messages).where(and(inArray(messages.id, ids), eq(messages.channelId, channelId), eq(messages.messageType, "chat"))) : [];
+  const byId = new Map(originals.map(m => [m.id, m]));
+  const externalId = (source: unknown): string | null => {
+    const meta = source as Record<string, unknown> | null;
+    return meta?.kind === (externalConversationId === undefined ? "external-dm" : "external-topic")
+      && meta.bindingId === binding.id && meta.bridgeAgentId === binding.bridgeAgentId
+      && meta.recipientAgentId === agent.id && meta.externalUserId === binding.externalUserId
+      && (externalConversationId === undefined || meta.externalConversationId === externalConversationId)
+      && typeof meta.externalMessageId === "string" ? meta.externalMessageId : null;
+  };
+  return replies.map((message, i) => {
+    const relation = relations[i]!;
+    const quote = relation.replyTo ? byId.get(relation.replyTo) : undefined;
+    const isRecipient = (m: typeof originals[number] | undefined) => m?.senderType === "user" && m.senderId === user.id;
+    const completedInputs = (relation.completedInputMessageIds ?? []).flatMap(id => {
+      const input = byId.get(id);
+      return isRecipient(input) ? [{ messageId: id, externalMessageId: externalId(input!.metadata) }] : [];
+    });
+    return { ...message, recipientReplyTo: isRecipient(quote) ? quote!.id : null,
+      quote: quote ? { messageId: quote.id, content: quote.content, externalMessageId: externalId(quote.metadata) } : null,
+      completedInputs };
+  });
+}
+
+export async function externalInputReads(
+  auth: NonNullable<Awaited<ReturnType<typeof externalMessageAuthority>>>, channelId: string,
+  requested: string[], externalConversationId?: string,
+) {
+  const { binding, user, agent } = auth, db = getDb();
+  const [cursor] = await db.select({ seq: agentChannelReadCursors.lastReadSeq }).from(agentChannelReadCursors)
+    .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, channelId)));
+  const reads = requested.length ? await db.select({ id: messages.id, metadata: messages.actionMetadata })
+    .from(messages).innerJoin(agentMessageBodyReads, eq(agentMessageBodyReads.messageId, messages.id))
+    .where(and(eq(agentMessageBodyReads.agentId, agent.id), eq(messages.channelId, channelId),
+      eq(messages.senderType, "user"), eq(messages.senderId, user.id), inArray(messages.id, requested))) : [];
+  const readMessageIds = reads.filter(input => {
+    const source = input.metadata as Record<string, unknown> | null;
+    return source?.kind === (externalConversationId === undefined ? "external-dm" : "external-topic")
+      && source.bindingId === binding.id && source.bridgeAgentId === binding.bridgeAgentId
+      && source.recipientAgentId === agent.id && source.externalUserId === binding.externalUserId
+      && (externalConversationId === undefined || source.externalConversationId === externalConversationId);
+  }).map(input => input.id);
+  return { targetHandle: agent.name, lastReadSeq: cursor?.seq ?? 0, readMessageIds, signal: "message_body_read_or_cursor" };
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
+import { readFileSync } from "node:fs";
 import { createApiTest } from "../test/integration/apiTest";
 import { fixturePasswordHash } from "../test/integration/credentials";
 import { users, messages } from "../db/schema";
@@ -36,7 +37,7 @@ test("native replies retain same-channel identity through history and keyed retr
   const body = await first.json(); assert.equal(first.status, 200, JSON.stringify(body));
   const [stored] = await db.select().from(messages).where(eq(messages.id, body.messageId));
   assert.equal(stored.channelId, h.channel.id); assert.equal(stored.threadId, null);
-  assert.equal(stored.content, "40.13"); assert.deepEqual(stored.actionMetadata, { kind: "reply", messageId: h.original.id });
+  assert.equal(stored.content, "40.13"); assert.deepEqual(stored.actionMetadata, { kind: "message", replyTo: h.original.id });
   const history = await h.call("/history?" + new URLSearchParams({ channel: `#${h.channel.name}`, consume: "false" }));
   assert.deepEqual((await history.json()).messages.find((m: { id: string }) => m.id === body.messageId).actionMetadata, stored.actionMetadata);
   const replay = await h.send({ idempotencyKey: key, replyTo: h.original.id });
@@ -59,19 +60,50 @@ test("native replies reject invalid, hidden and cross-channel origins", async ({
   assert.equal((await h.call("/send", { target: `#${h.channel.name}`, content: "denied", replyTo: h.original.id }, apiKey)).status, 403);
 });
 
-test("reply phases survive native history and reject a changed phase under the same send key", async ({ db, app }) => {
+test("completion is independent of quoting, canonical and fenced by the send key", async ({ db, app }) => {
   const h = await fixture(db, app.baseUrl);
-  for (const phase of ["progress", "final"]) {
-    const key = randomUUID();
-    const response = await h.send({ replyPhase: phase, idempotencyKey: key });
-    const result = await response.json();
-    assert.equal(response.status, 200, JSON.stringify(result));
-    const [stored] = await db.select().from(messages).where(eq(messages.id, result.messageId));
-    assert.deepEqual(stored.actionMetadata, { kind: "reply", messageId: h.original.id, phase });
-    const again = await h.send({ replyPhase: phase, idempotencyKey: key });
-    assert.equal((await again.json()).messageId, result.messageId);
-    assert.equal((await h.send({ replyPhase: phase === "final" ? "progress" : "final", idempotencyKey: key })).status, 409);
-  }
-  assert.equal((await h.send({ replyTo: undefined, replyPhase: "final" })).status, 400);
-  assert.equal((await h.send({ replyPhase: "done" })).status, 400);
+  const second = await createMessage(h.channel.id, "user", h.owner.id, "change the requirement");
+  const ids = [h.original.id,second.id].sort(), key = randomUUID();
+  const response = await h.send({ replyTo: undefined, completedInputMessageIds: [second.id.slice(0,8),h.original.id,h.original.id], idempotencyKey: key });
+  const result = await response.json(); assert.equal(response.status,200,JSON.stringify(result));
+  const [stored] = await db.select().from(messages).where(eq(messages.id,result.messageId));
+  assert.deepEqual(stored.actionMetadata,{kind:"message",completedInputMessageIds:ids});
+  const again = await h.send({replyTo:undefined,completedInputMessageIds:ids,idempotencyKey:key});
+  assert.equal((await again.json()).messageId,result.messageId);
+  for(const completedInputMessageIds of [[],[h.original.id],undefined])
+    assert.equal((await h.send({replyTo:undefined,completedInputMessageIds,idempotencyKey:key})).status,409);
+  const quoted=await h.send({replyTo:h.original.id,completedInputMessageIds:[second.id]});
+  const quotedBody=await quoted.json();assert.equal(quoted.status,200,JSON.stringify(quotedBody));
+  const [q]=await db.select().from(messages).where(eq(messages.id,quotedBody.messageId));
+  assert.deepEqual(q.actionMetadata,{kind:"message",replyTo:h.original.id,completedInputMessageIds:[second.id]});
+  assert.equal((await h.send({replyPhase:"final"})).status,400);
+});
+
+test("completion rejects hidden, cross-channel, nonhuman and another coordinator's inputs", async ({db,app})=>{
+  const h=await fixture(db,app.baseUrl);
+  const other=await createChannel(h.server.id,`other-${randomUUID().slice(0,8)}`,undefined,"private");
+  await addHuman(other.id,h.owner.id);
+  const hidden=await createMessage(other.id,"user",h.owner.id,"private");
+  const worker=await createMessage(h.channel.id,"agent",h.agent.id,"internal");
+  const assigned=await createMessage(h.channel.id,"user",h.owner.id,"another coordinator","chat",undefined,
+    {actionMetadata:{kind:"external-topic",recipientAgentId:randomUUID()}});
+  for(const id of [hidden.id,worker.id,assigned.id,randomUUID()])
+    assert.equal((await h.send({replyTo:undefined,completedInputMessageIds:[id]})).status,404);
+  await addAgent(other.id,h.agent.id);
+  assert.equal((await h.send({completedInputMessageIds:[hidden.id]})).status,404);
+  assert.equal((await h.send({completedInputMessageIds:["bad"]})).status,400);
+});
+
+test("data migration preserves old quotes and final completions exactly once", async ({db,app})=>{
+  const h=await fixture(db,app.baseUrl);
+  const progress=await createMessage(h.channel.id,"agent",h.agent.id,"progress","chat",undefined,
+    {actionMetadata:{kind:"reply",messageId:h.original.id,phase:"progress"}});
+  const final=await createMessage(h.channel.id,"agent",h.agent.id,"final","chat",undefined,
+    {actionMetadata:{kind:"reply",messageId:h.original.id,phase:"final"}});
+  const migration=readFileSync(new URL("../../drizzle/0375_message_relations.sql",import.meta.url),"utf8");
+  for(let i=0;i<2;i++)await db.execute(sql.raw(migration));
+  const [p]=await db.select().from(messages).where(eq(messages.id,progress.id));
+  const [f]=await db.select().from(messages).where(eq(messages.id,final.id));
+  assert.deepEqual(p.actionMetadata,{kind:"message",replyTo:h.original.id});
+  assert.deepEqual(f.actionMetadata,{kind:"message",replyTo:h.original.id,completedInputMessageIds:[h.original.id]});
 });

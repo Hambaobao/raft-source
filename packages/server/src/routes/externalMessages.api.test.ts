@@ -48,7 +48,7 @@ test("external DM sends are plain human messages in the same persistent DM as th
   assert.equal((await h.send({ externalMessageId: "first", content: "changed" })).status, 409);
 });
 
-test("normal DM replies follow the external input window and exclude later Web-only answers", async ({ db, app }) => {
+test("DM stream keeps its stable binding across later Web and external inputs", async ({ db, app }) => {
   const h = await fixture(db, app.baseUrl), sent = await h.send(), origin = await sent.json(); assert.equal(sent.status, 200, JSON.stringify(origin));
   for (const content of ["checking", "plain DM answer"]) {
     const response = await h.call("/send", { target: `dm:@${h.owner.name}~human`, content }, h.leadKey.apiKey);
@@ -62,11 +62,11 @@ test("normal DM replies follow the external input window and exclude later Web-o
     assert.equal(response.status, 200, JSON.stringify(await response.json()));
   }
   let page = await h.replies(origin.messageId); assert.equal(page.status, 200); let body = await page.json();
-  assert.deepEqual(body.messages.map((m: { content: string }) => m.content), ["checking", "plain DM answer", "hello from the lead"]);
-  assert.equal(body.superseded, true); assert.equal(body.delivery.outcome, "pending"); assert.equal(body.delivery.signal, "read_cursor");
+  assert.deepEqual(body.messages.map((m: { content: string }) => m.content), ["checking", "plain DM answer", "private unlinked discussion", "web-only answer", "hello from the lead"]);
+  assert.equal(body.delivery.lastReadSeq, 0); assert.equal(body.delivery.signal, "message_body_read_or_cursor");
   await db.insert(agentChannelReadCursors).values({ agentId: h.agent.id, channelId: origin.channelId, lastReadSeq: origin.messageSeq })
     .onConflictDoUpdate({ target: [agentChannelReadCursors.agentId, agentChannelReadCursors.channelId], set: { lastReadSeq: origin.messageSeq } });
-  body = await (await h.replies(origin.messageId)).json(); assert.equal(body.delivery.outcome, "read");
+  body = await (await h.replies(origin.messageId)).json(); assert.ok(body.delivery.lastReadSeq > 0);
   assert.equal((await h.replies(webMessage.id)).status, 404);
   assert.equal((await h.replies(randomUUID())).status, 404);
   assert.equal((await h.call('/history?channel='+encodeURIComponent(`dm:@${h.agent.name}~agent`))).status, 404);
@@ -124,7 +124,7 @@ test("topic input is scoped and human replies retain their original target after
   const worker = await createAgent(h.server.id, `worker-${randomUUID().slice(0,8)}`, { runtime: "claude", model: "sonnet" });
   await addAgent(h.channel.id, worker.id);
   await createMessage(h.channel.id, "user", "system", "A worker was added", "system");
-  await createMessage(h.channel.id, "agent", worker.id, "Internal worker report", "chat", undefined, { actionMetadata: { kind: "reply", messageId: origin.messageId } });
+  await createMessage(h.channel.id, "agent", worker.id, "Internal worker report", "chat", undefined, { actionMetadata: { kind: "message", replyTo: origin.messageId } });
   const internal = await createMessage(h.channel.id, "agent", worker.id, "Internal question");
   for (const [content, replyTo] of [["Internal assignment", undefined], ["Answer to worker", internal.id], ["Human answer", origin.messageId]]) {
     const response = await h.call("/send", { target: `#${h.channel.name}`, content, replyTo }, h.leadKey.apiKey);
@@ -227,8 +227,8 @@ test("topic stream forwards real leader mentions or human replies, including Web
   const response = await h.topicReplies(origin.messageId), page = await response.json();
   assert.equal(response.status, 200, JSON.stringify(page));
   assert.deepEqual(page.messages.map((m: {content:string}) => m.content), [`@${h.owner.name} proactive`, "Web reply", `@${h.owner.name} both`]);
-  assert.deepEqual(page.messages.map((m: {recipientMentioned:boolean;recipientReplyTo:string|null;recipientExternalMessageId:string|null}) =>
-    [m.recipientMentioned, m.recipientReplyTo, m.recipientExternalMessageId]), [[true,null,null],[false,web.id,null],[true,origin.messageId,"origin"]]);
+  assert.deepEqual(page.messages.map((m: {recipientMentioned:boolean;recipientReplyTo:string|null;quote:{externalMessageId:string|null}|null}) =>
+    [m.recipientMentioned, m.recipientReplyTo, m.quote?.externalMessageId??null]), [[true,null,null],[false,web.id,null],[true,origin.messageId,"origin"]]);
   assert.equal((await (await h.topicReplies(origin.messageId, `&after=${page.nextSeq}`)).json()).messages.length,0);
   assert.equal((await h.topicReplies(web.id)).status,404);
   process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = '[]';
@@ -251,11 +251,11 @@ test("topic stream advances across internal-only pages and resumes without dupli
 test("DM body consumption is visible without advancing the contiguous cursor", async ({ db, app }) => {
   const h = await fixture(db, app.baseUrl);
   const origin = await (await h.send()).json();
-  assert.equal((await (await h.replies(origin.messageId)).json()).delivery.outcome, "pending");
+  assert.deepEqual((await (await h.replies(origin.messageId)).json()).delivery.readMessageIds, []);
   await applyAgentModelSeen({ agentId: h.agent.id, serverId: h.server.id, channelId: origin.channelId, seqs: [origin.messageSeq] });
-  const result = await (await h.replies(origin.messageId)).json();
-  assert.equal(result.delivery.outcome, "read");
-  assert.equal(result.delivery.signal, "message_body_read");
+  const result = await (await h.replies(origin.messageId, "&readMessageIds="+origin.messageId)).json();
+  assert.deepEqual(result.delivery.readMessageIds, [origin.messageId]);
+  assert.equal(result.delivery.signal, "message_body_read_or_cursor");
 });
 test("topic read facts are exact and scoped to its bound human, agent and conversation", async ({ db, app }) => {
   const h = await topicFixture(db, app.baseUrl);

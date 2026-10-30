@@ -80,12 +80,14 @@ const agentApiSeenCardsSchema = lazySchema("agentApiSeenCardsSchema", () => z.ob
 
 export const agentApiReplyToSchema = lazySchema("agentApiReplyToSchema", () => z.string().regex(/^(?:[0-9a-f]{8}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i));
 
+export const agentApiCompletedInputsSchema = lazySchema("agentApiCompletedInputsSchema", () => z.array(agentApiReplyToSchema).max(100));
+
 const agentApiSendBodyKnownSchema = lazySchema("agentApiSendBodyKnownSchema", () => z.object({
   target: z.string().optional(),
   content: z.string().optional(),
   attachmentIds: optionalStringArraySchema,
   replyTo: agentApiReplyToSchema.optional(),
-  replyPhase: z.enum(["progress", "final"]).optional(),
+  completedInputMessageIds: agentApiCompletedInputsSchema.optional(),
   idempotencyKey: optionalStringSchema,
   reconcileOnly: optionalBooleanSchema,
   continue: optionalBooleanSchema,
@@ -306,7 +308,7 @@ export const agentApiSendResponseSchema = lazySchema("agentApiSendResponseSchema
 interface AgentApiSendBodyKnownFields {
   /** Reply to a message in the same conversation without creating a subthread. */
   replyTo?: string;
-  replyPhase?: "progress" | "final";
+  completedInputMessageIds?: string[];
   target?: string;
   content?: string;
   attachmentIds?: string[];

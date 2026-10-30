@@ -1,3 +1,4 @@
+import { messageRelationIdentity } from "./messageRelations";
 import { and, eq } from "drizzle-orm";
 import { getDb, type Database, type DatabaseExecutor } from "../db/index";
 import { attachments, messages } from "../db/schema";
@@ -167,11 +168,7 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
       if (replayedMessage.channelId !== channelId) {
         throw new AgentSendIdempotencyConflictError("target");
       }
-      const replyIdentity = (value: unknown) => {
-        const metadata = value as { kind?: string; messageId?: string; phase?: string } | null;
-        return metadata?.kind === "reply" ? JSON.stringify([metadata.messageId, metadata.phase ?? null]) : null;
-      };
-      if (replyIdentity(replayedMessage.actionMetadata) !== replyIdentity(opts.actionMetadata)) {
+      if (messageRelationIdentity(replayedMessage.actionMetadata) !== messageRelationIdentity(opts.actionMetadata)) {
         throw new AgentSendIdempotencyConflictError("reply");
       }
       if (replayedMessage.content !== content) {
