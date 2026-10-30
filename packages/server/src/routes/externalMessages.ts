@@ -1,9 +1,9 @@
 import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { and, asc, eq, gt, isNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, or, sql, inArray } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { agents, users, serverMembers, messages, agentChannelReadCursors } from "../db/schema";
+import { agents, users, serverMembers, messages, agentChannelReadCursors, messageMentions } from "../db/schema";
 import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
@@ -141,7 +141,29 @@ export async function externalDmReplies(req: Request, res: Response) {
       .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, origin.channelId)));
     // Native unmentioned DMs have no mention ACK. Name the actual signal;
     // never present persistence or online/idle status as a runtime receipt.
-    res.json({ messageId: origin.id, channelId: origin.channelId, messages: replies, superseded: Boolean(nextInput),
+    res.json({ messageId: origin.id, channelId: origin.channelId, recipientId: user.id, messages: await externalReplyPresentation(replies, user.id), superseded: Boolean(nextInput),
       delivery: { targetHandle: agent.name, outcome: cursor && cursor.seq >= origin.seq ? "read" : "pending", signal: "read_cursor" } });
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to read external DM replies", logPrefix: "external-dm.replies", err }); }
+}
+
+// Only strip a leading address confirmed by Raft's durable, exact mention fact.
+// Handle-at-send-time keeps replies correct after the recipient renames their handle.
+export async function externalReplyPresentation<T extends { id: string; content: string }>(replies: T[], userId: string) {
+  const facts = replies.length ? await getDb().select({ messageId: messageMentions.messageId, handle: messageMentions.handleAtSendTime })
+    .from(messageMentions).where(and(inArray(messageMentions.messageId, replies.map(m => m.id)),
+      eq(messageMentions.targetType, "user"), eq(messageMentions.targetId, userId), eq(messageMentions.confidence, "exact"))) : [];
+  return replies.map(message => {
+    let recipientMentionPrefix: string | null = null;
+    for (const fact of facts.filter(f => f.messageId === message.id)) {
+      for (const token of [`<@${fact.handle}>`, `@${fact.handle}`]) {
+        const leading = message.content.length - message.content.trimStart().length;
+        const start = message.content.slice(leading);
+        if (start.startsWith(token) && /^(?:\s|[,，:：]|$)/u.test(start.slice(token.length))) {
+          const length = leading + token.length;
+          recipientMentionPrefix = message.content.slice(0, length) + (message.content.slice(length).match(/^[\s,，:：]*/u)?.[0] ?? "");
+        }
+      }
+    }
+    return { ...message, recipientMentionPrefix };
+  });
 }

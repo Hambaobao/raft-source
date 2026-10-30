@@ -1,19 +1,21 @@
 import type { Request, Response } from "express";
+import { isDeepStrictEqual } from "node:util";
+import { structuredRaftMentionStillAppears } from "@botiverse/raft-shared";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { and, asc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray } from "drizzle-orm";
 import { getDb } from "../db/index";
-import { channelAgents, messages, agentChannelReadCursors } from "../db/schema";
+import { channelAgents, messages, messageMentions, agentChannelReadCursors } from "../db/schema";
 import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
-import { externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema } from "./externalMessages";
+import { externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema, externalReplyPresentation } from "./externalMessages";
 import { sendJsonServerError } from "./errorResponse";
 
 const conversationId = z.string().min(1).max(512);
-const inputSchema = externalMessageInputSchema.extend({ externalConversationId: conversationId });
-const lookupSchema = externalMessageLookupSchema.extend({ externalConversationId: conversationId });
+const inputSchema = externalMessageInputSchema.extend({ externalConversationId: conversationId, mentionRecipient: z.boolean() });
+const lookupSchema = externalMessageLookupSchema.extend({ externalConversationId: conversationId, anchorMessageId: z.string().uuid() });
 function unavailable(res: Response) { res.status(404).json({ code: "external_topic_unavailable" }); }
 
 // Explicit deployment opt-in delegates writing as one bound user only in private
@@ -49,10 +51,23 @@ export async function externalTopicSend(req: Request, res: Response) {
     ])).digest("hex");
     const metadata = { kind: "external-topic", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
       recipientAgentId: agent.id, externalUserId: input.externalUserId, externalMessageId: input.externalMessageId,
-      externalConversationId: input.externalConversationId };
+      externalConversationId: input.externalConversationId, mentionRecipient: input.mentionRecipient,
+      requestDigest: createHash("sha256").update(input.content).digest("hex") };
+    // Recover the original rendered mention after a handle rename or lost receipt.
+    const [prior] = await getDb().select().from(messages).where(and(eq(messages.randomId, randomId),
+      eq(messages.senderType, "user"), eq(messages.senderId, user.id), eq(messages.serverId, binding.serverId)));
+    if (prior) {
+      if (prior.channelId !== channel.id || !isDeepStrictEqual(prior.actionMetadata, metadata)) throw new messageService.UserRandomIdConflictError();
+      res.json({ messageId: prior.id, messageSeq: prior.seq, channelId: channel.id,
+        target: `#${channel.name}`, recipientId: agent.id, recipientHandle: agent.name });
+      return;
+    }
+    const content = input.mentionRecipient && !structuredRaftMentionStillAppears(input.content, agent.name)
+      ? `<@${agent.name}>\n${input.content}` : input.content;
     const message = await messageService.broadcastAndDeliver(req.app.get("io"), req.app.get("agentOrchestrator") as AgentOrchestrator, {
       channelId: channel.id, senderType: "user", senderId: user.id, senderName: user.displayName || user.name,
-      content: input.content, randomId, actionMetadata: metadata, mentionContract: "v2",
+      content, randomId, actionMetadata: metadata, mentionContract: "v2",
+      ...(input.mentionRecipient ? { mentions: [{ type: "agent", id: agent.id, name: agent.name }] } : {}),
     });
     res.json({ messageId: message.id, messageSeq: message.seq, channelId: channel.id,
       target: `#${channel.name}`, recipientId: agent.id, recipientHandle: agent.name });
@@ -63,38 +78,58 @@ export async function externalTopicSend(req: Request, res: Response) {
   }
 }
 
-export async function externalTopicReplies(req: Request, res: Response) {
+export async function externalTopicMessages(req: Request, res: Response) {
   try {
-    const parsed = lookupSchema.safeParse(req.query), id = z.string().uuid().safeParse(req.params.messageId);
-    if (!parsed.success || !id.success) { res.status(400).json({ code: "external_topic_invalid_request" }); return; }
+    const parsed = lookupSchema.safeParse(req.query);
+    if (!parsed.success) { res.status(400).json({ code: "external_topic_invalid_request" }); return; }
     const auth = await authority(req, res, parsed.data.externalUserId);
     if (!auth) return;
     const { binding, user, agent, channel } = auth, db = getDb();
-    const [origin] = await db.select().from(messages).where(eq(messages.id, id.data));
+    const [origin] = await db.select().from(messages).where(eq(messages.id, parsed.data.anchorMessageId));
     const meta = origin?.actionMetadata as Record<string, unknown> | null;
     if (!origin || origin.channelId !== channel.id || origin.senderType !== "user" || origin.senderId !== user.id
-      || meta?.kind !== "external-topic" || meta.bindingId !== binding.id || meta.bridgeAgentId !== binding.bridgeAgentId
-      || meta.recipientAgentId !== agent.id || meta.externalUserId !== binding.externalUserId
-      || meta.externalConversationId !== parsed.data.externalConversationId) { unavailable(res); return; }
-    // A shared channel contains coordination as well as user-facing answers.
-    // Only the bound leader's native, exact replies to this human input qualify.
-    // Read the next-human boundary in the same query: a stale answer must not be
-    // reattached to a correction or a Web-only question arriving concurrently.
-    const replies = await db.select({ id: messages.id, seq: messages.seq, channelId: messages.channelId,
-      senderId: messages.senderId, senderType: messages.senderType, content: messages.content, actionMetadata: messages.actionMetadata })
-      .from(messages).where(and(eq(messages.channelId, channel.id), eq(messages.senderType, "agent"),
-        eq(messages.senderId, agent.id), eq(messages.messageType, "chat"), gt(messages.seq, Math.max(origin.seq, parsed.data.after ?? 0)),
-        sql`${messages.actionMetadata}->>'kind' = 'reply'`, sql`${messages.actionMetadata}->>'messageId' = ${origin.id}`,
-        sql`NOT EXISTS (SELECT 1 FROM messages later_input WHERE later_input.channel_id = ${channel.id}
-          AND later_input.sender_type = 'user' AND later_input.message_type = 'chat' AND later_input.seq > ${origin.seq} AND later_input.seq < ${messages.seq})`,
-      )).orderBy(asc(messages.seq)).limit(100);
-    // Membership/system notices also use senderType=user; only chat inputs supersede.
-    const [nextInput] = await db.select({ seq: messages.seq }).from(messages).where(and(
-      eq(messages.channelId, channel.id), eq(messages.senderType, "user"), eq(messages.messageType, "chat"), gt(messages.seq, origin.seq),
-    )).orderBy(asc(messages.seq)).limit(1);
+      || origin.messageType !== "chat" || meta?.kind !== "external-topic" || meta.bindingId !== binding.id
+      || meta.bridgeAgentId !== binding.bridgeAgentId || meta.recipientAgentId !== agent.id
+      || meta.externalUserId !== binding.externalUserId || meta.externalConversationId !== parsed.data.externalConversationId) {
+      unavailable(res); return;
+    }
+    // This anchor proves the external conversation binding; it is not the question
+    // being answered. Scan every channel message so internal-only pages advance too.
+    const after = Math.max(origin.seq, parsed.data.after ?? 0);
+    const batch = await db.select({ id: messages.id, seq: messages.seq, channelId: messages.channelId,
+      senderId: messages.senderId, senderType: messages.senderType, content: messages.content,
+      messageType: messages.messageType, actionMetadata: messages.actionMetadata })
+      .from(messages).where(and(eq(messages.channelId, channel.id), gt(messages.seq, after)))
+      .orderBy(asc(messages.seq)).limit(100);
+    const candidates = batch.filter(m => m.senderType === "agent" && m.senderId === agent.id && m.messageType === "chat");
+    const mentions = candidates.length ? await db.select({ messageId: messageMentions.messageId }).from(messageMentions)
+      .where(and(inArray(messageMentions.messageId, candidates.map(m => m.id)), eq(messageMentions.targetType, "user"),
+        eq(messageMentions.targetId, user.id), eq(messageMentions.confidence, "exact"), eq(messageMentions.notifiableAtSend, true))) : [];
+    const mentioned = new Set(mentions.map(m => m.messageId));
+    const replyId = (m: typeof candidates[number]): string | null => {
+      const metadata = m.actionMetadata as { kind?: string; messageId?: string } | null;
+      return metadata?.kind === "reply" && z.string().uuid().safeParse(metadata.messageId).success ? metadata.messageId! : null;
+    };
+    const replyIds = [...new Set(candidates.map(replyId).filter((id): id is string => id !== null))];
+    const originals = replyIds.length ? await db.select({ id: messages.id, actionMetadata: messages.actionMetadata }).from(messages).where(and(
+      inArray(messages.id, replyIds), eq(messages.channelId, channel.id), eq(messages.senderType, "user"),
+      eq(messages.senderId, user.id), eq(messages.messageType, "chat"))) : [];
+    const humanReplies = new Map(originals.map(m => [m.id, m]));
+    const addressed = candidates.flatMap(message => {
+      const id = replyId(message);
+      const recipientMentioned = mentioned.has(message.id);
+      const recipientReplyTo = id && humanReplies.has(id) ? id : null;
+      const source = recipientReplyTo ? humanReplies.get(recipientReplyTo)?.actionMetadata as Record<string, unknown> | null : null;
+      const recipientExternalMessageId = source?.kind === "external-topic" && source.bindingId === binding.id
+        && source.bridgeAgentId === binding.bridgeAgentId && source.recipientAgentId === agent.id
+        && source.externalUserId === binding.externalUserId && source.externalConversationId === parsed.data.externalConversationId
+        && typeof source.externalMessageId === "string" ? source.externalMessageId : null;
+      return recipientMentioned || recipientReplyTo ? [{ ...message, recipientMentioned, recipientReplyTo, recipientExternalMessageId }] : [];
+    });
     const [cursor] = await db.select({ seq: agentChannelReadCursors.lastReadSeq }).from(agentChannelReadCursors)
       .where(and(eq(agentChannelReadCursors.agentId, agent.id), eq(agentChannelReadCursors.channelId, channel.id)));
-    res.json({ messageId: origin.id, channelId: channel.id, messages: replies, superseded: Boolean(nextInput),
-      delivery: { targetHandle: agent.name, outcome: cursor && cursor.seq >= origin.seq ? "read" : "pending", signal: "read_cursor" } });
-  } catch (err) { sendJsonServerError(req, res, { error: "Failed to read topic replies", logPrefix: "external-topic.replies", err }); }
+    res.json({ anchorMessageId: origin.id, channelId: channel.id, recipientId: user.id, coordinatorId: agent.id,
+      messages: await externalReplyPresentation(addressed, user.id), nextSeq: batch.at(-1)?.seq ?? after, hasMore: batch.length === 100,
+      delivery: { targetHandle: agent.name, lastReadSeq: cursor?.seq ?? 0, signal: "read_cursor" } });
+  } catch (err) { sendJsonServerError(req, res, { error: "Failed to read topic messages", logPrefix: "external-topic.messages", err }); }
 }
