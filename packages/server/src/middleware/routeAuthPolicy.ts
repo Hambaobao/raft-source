@@ -97,6 +97,9 @@ export const routeAuthPolicy: readonly RouteAuthPolicyEntry[] = [
     principal: "sk_agent",
     note: "locator-only feedback v0 — content-free triage index query",
   },
+  { method: "GET", path: "/internal/agent-api/external-dm/:bindingId", principal: "sk_agent", note: "Deployment-bound external human DM transport" },
+  { method: "POST", path: "/internal/agent-api/external-dm/:bindingId/messages", principal: "sk_agent", note: "Deployment-bound external human DM transport" },
+  { method: "GET", path: "/internal/agent-api/external-dm/:bindingId/messages/:messageId/replies", principal: "sk_agent", note: "Deployment-bound external human DM transport" },
   {
     method: "GET",
     path: "/internal/agent-api/context",

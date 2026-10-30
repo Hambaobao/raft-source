@@ -1,3 +1,4 @@
+import { externalDmBinding, externalDmSend, externalDmReplies } from "./externalDirectMessages";
 import { raftbenchContextQuerySchema, raftbenchReportSchema } from "@botiverse/raft-shared";
 import { readContext as readRaftbenchContext, submitReport as submitRaftbenchReport, RaftbenchError } from "../raftbench/service";
 import { getAppInstallationSetup } from "../services/appSetupService";
@@ -2474,7 +2475,7 @@ registerAgentApiRoute("agentContext", async (req, res) => {
       server: { id: server.id, slug: server.slug, name: server.name },
       credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
       prompt,
-      features: { ...await agentContextFeatures(serverId), externalReplies: true },
+      features: { ...await agentContextFeatures(serverId), externalReplies: true, externalDirectMessages: true },
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -9654,3 +9655,8 @@ registerAgentApiRoute("raftbenchSubmit", validateAgentApiResponseMiddleware("raf
   try { sendAgentApiResponse("raftbenchSubmit", res, await submitRaftbenchReport(req.serverId!, req.actingAgentId!, parsed.data)); }
   catch (error) { sendRaftbenchError(error, res); }
 });
+
+// Narrow deployment-authorized external user DM transport. It never grants generic user API access.
+internalAgentApiRouter.get("/external-dm/:bindingId", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmBinding);
+internalAgentApiRouter.post("/external-dm/:bindingId/messages", requireAgentCapability("send"), requireAgentGrant("message:send"), externalDmSend);
+internalAgentApiRouter.get("/external-dm/:bindingId/messages/:messageId/replies", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmReplies);
