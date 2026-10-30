@@ -2474,7 +2474,7 @@ registerAgentApiRoute("agentContext", async (req, res) => {
       server: { id: server.id, slug: server.slug, name: server.name },
       credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
       prompt,
-      features: await agentContextFeatures(serverId),
+      features: { ...await agentContextFeatures(serverId), externalReplies: true },
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -5143,6 +5143,7 @@ async function handleAgentApiMessageSend(
       target,
       content,
       attachmentIds,
+      externalReply,
       idempotencyKey,
       reconcileOnly,
       continue: deprecatedContinue,
@@ -5327,6 +5328,19 @@ async function handleAgentApiMessageSend(
       throw err;
     }
 
+    let replyMetadata: { kind: "external-reply"; messageId: string; title?: string } | undefined;
+    if (externalReply) {
+      const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, externalReply.messageId);
+      const original = reference.ok ? await messageService.getMessage(reference.messageId) : null;
+      // Restrict this first connector contract to the same local conversation.
+      // No cross-channel pointers or hidden-message existence are exposed.
+      if (!original || original.channelId !== resolved.channelId) {
+        res.status(404).json({ error: "Reply message is not available in this conversation", code: "external_reply_not_found" });
+        return;
+      }
+      replyMetadata = { kind: "external-reply", messageId: original.id, ...(externalReply.title === undefined ? {} : { title: externalReply.title }) };
+    }
+
     // Cards (passive AX): the target's channel card (`seenCards.channel`) and
     // a DM target's peer card (`seenCards.peer`), each only for a client that
     // names the version its model context has (null: not seen). Never seen in
@@ -5490,6 +5504,7 @@ async function handleAgentApiMessageSend(
         senderId: actingAgentId,
         senderName: agent.displayName || agent.name || "Agent",
         content,
+        ...(replyMetadata ? { actionMetadata: replyMetadata } : {}),
         mentions,
         mentionContract: routeKey === "messageSendV2" ? "v2" : "v1",
         attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [],

@@ -995,6 +995,7 @@ export const agentApiAgentContextResponseSchema = lazySchema("agentApiAgentConte
   // values a managed agent's Computer receives at start (AgentConfig
   // reminderApp / vaultApp). Optional for older Servers; absent means off.
   features: passthroughObject({
+    externalReplies: z.boolean().optional(),
     reminderApp: z.boolean(),
     vaultApp: z.boolean(),
   }).optional(),

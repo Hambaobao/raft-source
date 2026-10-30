@@ -18,6 +18,7 @@ export interface CommandStateStreamEntry {
 
 /** A held send's draft, one per target, as stored (policy: drafts.ts). */
 export interface CommandStateDraftEntry {
+  externalReply?: unknown;
   content: string;
   attachmentIds: string[];
   idempotencyKey?: string;
