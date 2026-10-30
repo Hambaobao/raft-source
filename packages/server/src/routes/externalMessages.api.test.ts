@@ -4,7 +4,7 @@ import { afterEach } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { createApiTest } from "../test/integration/apiTest";
 import { fixturePasswordHash } from "../test/integration/credentials";
-import { users, messages, agentChannelReadCursors, channelAgents, channelHumans } from "../db/schema";
+import { users, serverMembers, messages, messageMentions, agents, agentChannelReadCursors, channelAgents, channelHumans } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { createAgent, assignMachine } from "../services/agentService";
 import { registerMachine } from "../services/machineService";
@@ -97,13 +97,13 @@ async function topicFixture(db: Database, baseUrl: string) {
     type: "agent", id: h.bridge.id, initialUserIds: [h.owner.id], initialAgentIds: [h.agent.id],
   });
   const send = (overrides: Record<string, unknown> = {}, channelId = channel.id) => h.call(`/external-messages/personal/topics/${channelId}/messages`, {
-    externalUserId: "feishu-person", externalConversationId: "topic-one", externalMessageId: randomUUID(), content: "Please calculate this", ...overrides,
+    externalUserId: "feishu-person", externalConversationId: "topic-one", mentionRecipient: false, externalMessageId: randomUUID(), content: "Please calculate this", ...overrides,
   });
-  const replies = (id: string, extra = "") => h.call(`/external-messages/personal/topics/${channel.id}/messages/${id}/replies?externalUserId=feishu-person&externalConversationId=topic-one${extra}`);
+  const replies = (id: string, extra = "") => h.call(`/external-messages/personal/topics/${channel.id}/messages?anchorMessageId=${id}&externalUserId=feishu-person&externalConversationId=topic-one${extra}`);
   return { ...h, channel, topicSend: send, topicReplies: replies };
 }
 
-test("topic input is a scoped human message and only exact leader replies return", async ({ db, app }) => {
+test("topic input is scoped and human replies retain their original target after corrections", async ({ db, app }) => {
   const h = await topicFixture(db, app.baseUrl), first = await h.topicSend({ externalMessageId: "first" }), origin = await first.json();
   assert.equal(first.status, 200, JSON.stringify(origin));
   const [stored] = await db.select().from(messages).where(eq(messages.id, origin.messageId));
@@ -131,23 +131,25 @@ test("topic input is a scoped human message and only exact leader replies return
   }
   let page = await h.topicReplies(origin.messageId), body = await page.json(); assert.equal(page.status, 200, JSON.stringify(body));
   assert.deepEqual(body.messages.map((m: {content:string}) => m.content), ["Human answer"]);
-  assert.equal(body.superseded, false);
-  assert.equal(body.delivery.outcome, "pending");
+  assert.equal(body.messages[0].recipientReplyTo, origin.messageId);
+  assert.equal(body.delivery.lastReadSeq, 0);
   await db.insert(agentChannelReadCursors).values({ agentId: h.agent.id, channelId: h.channel.id, lastReadSeq: origin.messageSeq });
-  body = await (await h.topicReplies(origin.messageId)).json(); assert.equal(body.delivery.outcome, "read");
+  body = await (await h.topicReplies(origin.messageId)).json(); assert.equal(body.delivery.lastReadSeq, origin.messageSeq);
   const correction = await h.topicSend({ content: "Change the discount" }); assert.equal(correction.status, 200);
   await h.call("/send", { target: `#${h.channel.name}`, content: "Stale answer", replyTo: origin.messageId }, h.leadKey.apiKey);
   body = await (await h.topicReplies(origin.messageId)).json();
-  assert.equal(body.superseded, true); assert.deepEqual(body.messages.map((m: {content:string}) => m.content), ["Human answer"]);
+  assert.deepEqual(body.messages.map((m: {content:string}) => m.content), ["Human answer", "Stale answer"]);
   const correctionId = (await correction.json()).messageId;
-  assert.deepEqual((await (await h.topicReplies(correctionId)).json()).messages, []);
+  const later = (await (await h.topicReplies(correctionId)).json()).messages;
+  assert.deepEqual(later.map((m: {content:string}) => m.content), ["Stale answer"]);
+  assert.equal(later[0].recipientReplyTo, origin.messageId);
 });
 
 test("topic delegation requires private Bridge administration, current members and exact origin scope", async ({ db, app }) => {
   const h = await topicFixture(db, app.baseUrl), sent = await h.topicSend(), origin = await sent.json(); assert.equal(sent.status, 200);
   assert.equal((await h.topicSend({ externalUserId: "another" })).status, 404);
   assert.equal((await h.topicSend({ userId: h.owner.id })).status, 400);
-  const badScope = await h.call(`/external-messages/personal/topics/${h.channel.id}/messages/${origin.messageId}/replies?externalUserId=feishu-person&externalConversationId=other`);
+  const badScope = await h.call(`/external-messages/personal/topics/${h.channel.id}/messages?anchorMessageId=${origin.messageId}&externalUserId=feishu-person&externalConversationId=other`);
   assert.equal(badScope.status, 404);
   const dm = await findOrCreateDM(h.server.id, h.owner.id, h.agent.id); assert.equal((await h.topicSend({}, dm!.id)).status, 404);
   const other = await createChannel(h.server.id, `unmanaged-${randomUUID().slice(0,8)}`, undefined, "private");
@@ -160,4 +162,87 @@ test("topic delegation requires private Bridge administration, current members a
   assert.equal((await h.topicSend()).status, 404);
   process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = JSON.stringify([{...h.binding,allowTopics:false}]);
   assert.equal((await h.topicReplies(origin.messageId)).status, 404);
+});
+
+
+test("topic automatic mentions bind the leader, deduplicate authored mentions and survive rename retries", async ({ db, app }) => {
+  const h = await topicFixture(db, app.baseUrl);
+  await db.update(users).set({ name: h.agent.name }).where(eq(users.id, h.owner.id));
+  const first = await h.topicSend({ externalMessageId: "mentioned", mentionRecipient: true });
+  const body = await first.json(); assert.equal(first.status, 200, JSON.stringify(body));
+  const [message] = await db.select().from(messages).where(eq(messages.id, body.messageId));
+  assert.equal(message.content, `<@${h.agent.name}>\nPlease calculate this`);
+  const mentions = await db.select().from(messageMentions).where(eq(messageMentions.messageId, body.messageId));
+  assert.deepEqual(mentions.map(m => [m.targetType,m.targetId]), [["agent",h.agent.id]]);
+  const text = `@${h.agent.name} please check this`;
+  const manual = await h.topicSend({ content: text, mentionRecipient: true }); const manualBody = await manual.json();
+  assert.equal(manual.status, 200, JSON.stringify(manualBody));
+  assert.equal((await db.select().from(messages).where(eq(messages.id,manualBody.messageId)))[0].content,text);
+  const newName = `renamed-${randomUUID().slice(0,8)}`;
+  await db.update(agents).set({name:newName}).where(eq(agents.id,h.agent.id));
+  const retry = await h.topicSend({ externalMessageId: "mentioned", mentionRecipient: true });
+  assert.equal(retry.status,200); assert.equal((await retry.json()).messageId,body.messageId);
+  assert.equal((await h.topicSend({ externalMessageId: "mentioned", mentionRecipient: false })).status,409);
+});
+
+test("external reply presentation uses exact recipient mention facts, not matching text", async ({ db, app }) => {
+  const h = await topicFixture(db, app.baseUrl), sent = await h.topicSend(), origin = await sent.json();
+  for (const content of ["@" + h.owner.name + " result", "`@" + h.owner.name + "` is a code example"]) {
+    const r=await h.call("/send",{target:`#${h.channel.name}`,content,replyTo:origin.messageId},h.leadKey.apiKey);
+    assert.equal(r.status,200,JSON.stringify(await r.json()));
+  }
+  await db.update(users).set({name:`renamed-${randomUUID().slice(0,8)}`}).where(eq(users.id,h.owner.id));
+  const page=await (await h.topicReplies(origin.messageId)).json();
+  assert.equal(page.recipientId,h.owner.id);
+  assert.equal(page.messages[0].recipientMentionPrefix,`@${h.owner.name} `);
+  assert.equal(page.messages[1].recipientMentionPrefix,null);
+});
+
+test("topic stream forwards real leader mentions or human replies, including Web input, exactly once", async ({ db, app }) => {
+  const h = await topicFixture(db, app.baseUrl);
+  const origin = await (await h.topicSend({ externalMessageId: "origin" })).json();
+  const web = await createMessage(h.channel.id, "user", h.owner.id, "Web follow-up");
+  const worker = await createAgent(h.server.id, `helper-${randomUUID().slice(0,8)}`, { runtime: "claude", model: "sonnet" });
+  await addAgent(h.channel.id, worker.id);
+  const workerKey = await mintAgentCredential({ agentId: worker.id, scopes: ["send"], name: "helper", createdByUserId: null });
+  const internal = await createMessage(h.channel.id, "agent", worker.id, "Internal question");
+  const [other] = await db.insert(users).values({ email: `other-${randomUUID()}@raft.test`, name: `other-${randomUUID().slice(0,8)}`,
+    passwordHash: await fixturePasswordHash("password123"), emailVerified: true }).returning();
+  await db.insert(serverMembers).values({serverId:h.server.id,userId:other.id,role:"member"});
+  await addHuman(h.channel.id, other.id);
+  for (const [content, replyTo, token] of [
+    [`@${h.owner.name} proactive`, undefined, h.leadKey.apiKey],
+    ["Web reply", web.id, h.leadKey.apiKey],
+    [`@${h.owner.name} both`, origin.messageId, h.leadKey.apiKey],
+    [`@${h.owner.name} worker report`, origin.messageId, workerKey.apiKey],
+    ["Reply to worker", internal.id, h.leadKey.apiKey],
+    [`Plain ${h.owner.name}`, undefined, h.leadKey.apiKey],
+    ["`@" + h.owner.name + "` code example", undefined, h.leadKey.apiKey],
+    [`@${other.name} other recipient`, undefined, h.leadKey.apiKey],
+  ]) {
+    const r = await h.call("/send", { target: `#${h.channel.name}`, content, replyTo }, token);
+    assert.equal(r.status, 200, JSON.stringify(await r.json()));
+  }
+  const response = await h.topicReplies(origin.messageId), page = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(page));
+  assert.deepEqual(page.messages.map((m: {content:string}) => m.content), [`@${h.owner.name} proactive`, "Web reply", `@${h.owner.name} both`]);
+  assert.deepEqual(page.messages.map((m: {recipientMentioned:boolean;recipientReplyTo:string|null;recipientExternalMessageId:string|null}) =>
+    [m.recipientMentioned, m.recipientReplyTo, m.recipientExternalMessageId]), [[true,null,null],[false,web.id,null],[true,origin.messageId,"origin"]]);
+  assert.equal((await (await h.topicReplies(origin.messageId, `&after=${page.nextSeq}`)).json()).messages.length,0);
+  assert.equal((await h.topicReplies(web.id)).status,404);
+  process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = '[]';
+  assert.equal((await h.topicReplies(origin.messageId)).status,404);
+});
+
+test("topic stream advances across internal-only pages and resumes without duplicating eligible messages", async ({ db, app }) => {
+  const h = await topicFixture(db, app.baseUrl), origin = await (await h.topicSend()).json();
+  for(let i=0;i<100;i++) await createMessage(h.channel.id,"agent",h.agent.id,"Internal note");
+  const r=await h.call("/send",{target:`#${h.channel.name}`,content:`@${h.owner.name} update`},h.leadKey.apiKey);
+  assert.equal(r.status,200,JSON.stringify(await r.json()));
+  const first=await (await h.topicReplies(origin.messageId)).json();
+  assert.equal(first.hasMore,true);assert.deepEqual(first.messages,[]);assert.ok(first.nextSeq>origin.messageSeq);
+  const second=await (await h.topicReplies(origin.messageId,`&after=${first.nextSeq}`)).json();
+  assert.equal(second.hasMore,false);assert.equal(second.messages.length,1);assert.ok(second.nextSeq>first.nextSeq);
+  const third=await (await h.topicReplies(origin.messageId,`&after=${second.nextSeq}`)).json();
+  assert.deepEqual(third.messages,[]);assert.equal(third.nextSeq,second.nextSeq);
 });
