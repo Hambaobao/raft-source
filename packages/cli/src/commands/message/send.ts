@@ -13,7 +13,7 @@ import type {
   AgentApiStructuredMention,
 } from "@botiverse/raft-shared";
 import {
-  agentApiExternalReplySchema,
+  agentApiReplyToSchema,
   currentTimeMs,
   formatAgentThreadTargetCheck,
   structuredRaftMentionStillAppears,
@@ -87,8 +87,7 @@ export {
 } from "./_format";
 
 interface SendOpts extends ReviewerIsolationOpts {
-  externalReplyTo?: string;
-  externalReplyTitle?: string;
+  replyTo?: string;
   target: string;
   content?: string;
   attachmentId?: string[];
@@ -350,13 +349,10 @@ export function rejectArgContent(positionalContent: string[], opts: Pick<SendOpt
 }
 
 export function validateDraftSendFlags(
-  opts: Pick<SendOpts, "sendDraft" | "discardDraft" | "expectedDraftKey" | "anyway" | "attachmentId" | "mention" | "externalReplyTo" | "externalReplyTitle">,
+  opts: Pick<SendOpts, "sendDraft" | "discardDraft" | "expectedDraftKey" | "anyway" | "attachmentId" | "mention" | "replyTo">,
 ): void {
-  if ((opts.sendDraft || opts.discardDraft) && (opts.externalReplyTo !== undefined || opts.externalReplyTitle !== undefined)) {
-    throw new SendContentError("EXTERNAL_REPLY_DRAFT_OVERRIDE", "External reply routing is saved with the draft. Use --send-draft without reply flags, or a new send to change the reply.");
-  }
-  if (opts.externalReplyTitle !== undefined && opts.externalReplyTo === undefined) {
-    throw new SendContentError("EXTERNAL_REPLY_TARGET_REQUIRED", "--external-reply-title requires --external-reply-to.");
+  if ((opts.sendDraft || opts.discardDraft) && opts.replyTo !== undefined) {
+    throw new SendContentError("REPLY_DRAFT_OVERRIDE", "Reply routing is saved with the draft. Resume it without --reply-to, or start a new send.");
   }
   if (opts.discardDraft && opts.sendDraft) {
     throw new SendContentError(
@@ -693,11 +689,11 @@ async function handleMessageSend(
     if (err instanceof SendContentError) throw cliError(err.code, err.message, { cause: err });
     throw err;
   }
-  let outgoingExternalReply: AgentApiSendV2Body["externalReply"];
-  if (opts.externalReplyTo !== undefined) {
-    const parsed = agentApiExternalReplySchema.safeParse({ messageId: opts.externalReplyTo, ...(opts.externalReplyTitle === undefined ? {} : { title: opts.externalReplyTitle }) });
-    if (!parsed.success) throw cliError("INVALID_EXTERNAL_REPLY", "Use the original message's full UUID or 8-character msg ID; an optional title must be 1-120 characters.");
-    outgoingExternalReply = parsed.data;
+  let outgoingReplyTo: string | undefined;
+  if (opts.replyTo !== undefined) {
+    const parsed = agentApiReplyToSchema.safeParse(opts.replyTo);
+    if (!parsed.success) throw cliError("INVALID_REPLY_TARGET", "Use the original message full UUID or 8-character msg ID.");
+    outgoingReplyTo = parsed.data;
   }
   let content: string | undefined;
   let outgoingContent = "";
@@ -805,7 +801,7 @@ async function handleMessageSend(
         },
       );
     }
-    outgoingExternalReply = savedDraft.externalReply;
+    outgoingReplyTo = savedDraft.replyTo;
     outgoingContent = savedDraft.content;
     outgoingAttachmentIds = savedDraft.attachmentIds;
     outgoingMentions = explicitMentions.length > 0 ? explicitMentions : (savedDraft.mentions ?? []);
@@ -818,7 +814,7 @@ async function handleMessageSend(
         ...savedDraft,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
       });
     }
     setFailureDraftSaved(true);
@@ -856,7 +852,7 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount,
         seenUpToSeq,
@@ -901,7 +897,7 @@ async function handleMessageSend(
   const body: AgentApiSendV2Body = {
     target,
     content: outgoingContent,
-    ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+    ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
     idempotencyKey,
     draftReholdCount: previousDraftReholdCount,
   };
@@ -948,7 +944,7 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount,
         seenUpToSeq,
@@ -1090,7 +1086,7 @@ async function handleMessageSend(
         attachmentIds: outgoingAttachmentIds,
         idempotencyKey,
         mentions: outgoingMentions,
-        ...(outgoingExternalReply ? { externalReply: outgoingExternalReply } : {}),
+        ...(outgoingReplyTo ? { replyTo: outgoingReplyTo } : {}),
         savedAt: currentTimeMs(),
         reholdCount: previousDraftReholdCount + 1,
         // A hold for the card alone showed no messages: keep what was attested.
@@ -1314,8 +1310,7 @@ export const messageSendCommand = defineCommand(
     options: [
       { flags: "--target <target>", description: "Target: '#channel', 'dm:@peer', '#channel:shortid', 'dm:@peer:shortid' (a thread: shortid is its root message's msg=, as in replyTarget)" },
       PEER_KIND_OPTION,
-      { flags: "--external-reply-to <message-id>", description: "Submit a user-facing answer to an external connector. Use the original message's msg ID in this same --target; internal discussion must omit this flag. The connector validates sender/current task and handles external delivery. The send receipt confirms Raft persistence, not external delivery." },
-      { flags: "--external-reply-title <title>", description: "Suggest a conversation title with an external reply (1-120 characters); requires --external-reply-to." },
+      { flags: "--reply-to <message-id>", description: "Reply to this message in the same --target without creating a subthread. Use the msg ID of the person you are answering; replies to teammates should name their message instead. Routing is saved with held drafts." },
       {
         flags: "--send-draft",
         description:

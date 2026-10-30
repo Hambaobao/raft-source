@@ -1,4 +1,5 @@
-import { externalDmBinding, externalDmSend, externalDmReplies } from "./externalDirectMessages";
+import { externalTopicSend, externalTopicReplies } from "./externalTopicMessages";
+import { externalDmBinding, externalDmSend, externalDmReplies } from "./externalMessages";
 import { raftbenchContextQuerySchema, raftbenchReportSchema } from "@botiverse/raft-shared";
 import { readContext as readRaftbenchContext, submitReport as submitRaftbenchReport, RaftbenchError } from "../raftbench/service";
 import { getAppInstallationSetup } from "../services/appSetupService";
@@ -2475,7 +2476,7 @@ registerAgentApiRoute("agentContext", async (req, res) => {
       server: { id: server.id, slug: server.slug, name: server.name },
       credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
       prompt,
-      features: { ...await agentContextFeatures(serverId), externalReplies: true, externalDirectMessages: true },
+      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true },
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -5144,7 +5145,7 @@ async function handleAgentApiMessageSend(
       target,
       content,
       attachmentIds,
-      externalReply,
+      replyTo,
       idempotencyKey,
       reconcileOnly,
       continue: deprecatedContinue,
@@ -5329,17 +5330,15 @@ async function handleAgentApiMessageSend(
       throw err;
     }
 
-    let replyMetadata: { kind: "external-reply"; messageId: string; title?: string } | undefined;
-    if (externalReply) {
-      const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, externalReply.messageId);
+    let replyMetadata: { kind: "reply"; messageId: string } | undefined;
+    if (replyTo) {
+      const reference = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, replyTo);
       const original = reference.ok ? await messageService.getMessage(reference.messageId) : null;
-      // Restrict this first connector contract to the same local conversation.
-      // No cross-channel pointers or hidden-message existence are exposed.
       if (!original || original.channelId !== resolved.channelId) {
-        res.status(404).json({ error: "Reply message is not available in this conversation", code: "external_reply_not_found" });
+        res.status(404).json({ error: "Reply message is not available in this conversation", code: "reply_not_found" });
         return;
       }
-      replyMetadata = { kind: "external-reply", messageId: original.id, ...(externalReply.title === undefined ? {} : { title: externalReply.title }) };
+      replyMetadata = { kind: "reply", messageId: original.id };
     }
 
     // Cards (passive AX): the target's channel card (`seenCards.channel`) and
@@ -9657,6 +9656,8 @@ registerAgentApiRoute("raftbenchSubmit", validateAgentApiResponseMiddleware("raf
 });
 
 // Narrow deployment-authorized external user DM transport. It never grants generic user API access.
-internalAgentApiRouter.get("/external-dm/:bindingId", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmBinding);
-internalAgentApiRouter.post("/external-dm/:bindingId/messages", requireAgentCapability("send"), requireAgentGrant("message:send"), externalDmSend);
-internalAgentApiRouter.get("/external-dm/:bindingId/messages/:messageId/replies", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmReplies);
+internalAgentApiRouter.post("/external-messages/:bindingId/topics/:channelId/messages", requireAgentCapability("send"), requireAgentGrant("message:send"), externalTopicSend);
+internalAgentApiRouter.get("/external-messages/:bindingId/topics/:channelId/messages/:messageId/replies", requireAgentCapability("read"), requireAgentGrant("message:read"), externalTopicReplies);
+internalAgentApiRouter.get("/external-messages/:bindingId", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmBinding);
+internalAgentApiRouter.post("/external-messages/:bindingId/messages", requireAgentCapability("send"), requireAgentGrant("message:send"), externalDmSend);
+internalAgentApiRouter.get("/external-messages/:bindingId/messages/:messageId/replies", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmReplies);

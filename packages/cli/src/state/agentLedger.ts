@@ -60,7 +60,7 @@ export interface LedgerStreamEntry {
 }
 
 export interface LedgerDraftEntry {
-  externalReply?: unknown;
+  replyTo?: unknown;
   content: string;
   attachmentIds: string[];
   idempotencyKey?: string;

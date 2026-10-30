@@ -17,6 +17,7 @@ const bindingSchema = z.object({
   serverId: z.string().uuid(), bridgeAgentId: z.string().uuid(),
   userId: z.string().uuid(), agentId: z.string().uuid(),
   externalUserId: z.string().min(1).max(256),
+  allowTopics: z.boolean(),
 }).strict();
 const bindingsSchema = z.array(bindingSchema).max(100).superRefine((rows, ctx) => {
   const ids = new Set<string>(), peers = new Set<string>();
@@ -26,20 +27,20 @@ const bindingsSchema = z.array(bindingSchema).max(100).superRefine((rows, ctx) =
     ids.add(row.id); peers.add(peer);
   }
 });
-const inputSchema = z.object({
+export const externalMessageInputSchema = z.object({
   externalUserId: z.string().min(1).max(256),
   externalMessageId: z.string().min(1).max(256),
   content: z.string().min(1).max(32000).refine(value => value.trim().length > 0),
 }).strict();
-const lookupSchema = z.object({
+export const externalMessageLookupSchema = z.object({
   externalUserId: z.string().min(1).max(256),
   after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
 }).strict();
 
 function unavailable(res: Response) { res.status(404).json({ code: "external_dm_unavailable" }); }
-async function authority(req: Request, res: Response, externalUserId: string) {
+export async function externalMessageAuthority(req: Request, res: Response, externalUserId: string) {
   let bindings: z.infer<typeof bindingsSchema>;
-  try { bindings = bindingsSchema.parse(JSON.parse(process.env.RAFT_EXTERNAL_DM_BINDINGS || "[]")); }
+  try { bindings = bindingsSchema.parse(JSON.parse(process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS || "[]")); }
   catch { res.status(503).json({ code: "external_dm_config_invalid" }); return null; }
   const binding = bindings.find(row => row.id === req.params.bindingId && row.serverId === req.serverId
     && row.bridgeAgentId === req.actingAgentId && row.externalUserId === externalUserId);
@@ -58,19 +59,19 @@ async function authority(req: Request, res: Response, externalUserId: string) {
 
 export async function externalDmBinding(req: Request, res: Response) {
   try {
-    const parsed = lookupSchema.safeParse(req.query);
+    const parsed = externalMessageLookupSchema.safeParse(req.query);
     if (!parsed.success) { res.status(400).json({ code: "external_dm_invalid_request" }); return; }
-    const auth = await authority(req, res, parsed.data.externalUserId);
+    const auth = await externalMessageAuthority(req, res, parsed.data.externalUserId);
     if (!auth) return;
-    res.json({ bindingId: auth.binding.id, user: auth.user, agent: { id: auth.agent.id, name: auth.agent.name } });
+    res.json({ bindingId: auth.binding.id, topicsEnabled: auth.binding.allowTopics === true, user: auth.user, agent: { id: auth.agent.id, name: auth.agent.name } });
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to resolve DM binding", logPrefix: "external-dm.binding", err }); }
 }
 
 export async function externalDmSend(req: Request, res: Response) {
   try {
-    const parsed = inputSchema.safeParse(req.body);
+    const parsed = externalMessageInputSchema.safeParse(req.body);
     if (!parsed.success) { res.status(400).json({ code: "external_dm_invalid_request" }); return; }
-    const input = parsed.data, auth = await authority(req, res, input.externalUserId);
+    const input = parsed.data, auth = await externalMessageAuthority(req, res, input.externalUserId);
     if (!auth) return;
     const { binding, user, agent } = auth;
     // This is the same canonical human/Agent pair used by the Web DM UI.
@@ -80,7 +81,7 @@ export async function externalDmSend(req: Request, res: Response) {
     if (await isChannelReadOnlyByQuota(dm.id, req.serverId!) || await isChannelReadOnlyByBillingFeature(dm.id, req.serverId!)) {
       res.status(403).json({ code: "external_dm_read_only" }); return;
     }
-    const randomId = "external-dm-" + createHash("sha256").update(JSON.stringify([
+    const randomId = "external-message-" + createHash("sha256").update(JSON.stringify([
       binding.serverId, binding.bridgeAgentId, binding.id, input.externalMessageId,
     ])).digest("hex");
     const metadata = { kind: "external-dm", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
@@ -101,12 +102,12 @@ export async function externalDmSend(req: Request, res: Response) {
 
 export async function externalDmReplies(req: Request, res: Response) {
   try {
-    const parsed = lookupSchema.safeParse(req.query);
+    const parsed = externalMessageLookupSchema.safeParse(req.query);
     const messageId = z.string().uuid().safeParse(req.params.messageId);
     if (!parsed.success || !messageId.success) {
       res.status(400).json({ code: "external_dm_invalid_request" }); return;
     }
-    const auth = await authority(req, res, parsed.data.externalUserId);
+    const auth = await externalMessageAuthority(req, res, parsed.data.externalUserId);
     if (!auth) return;
     const { binding, user, agent } = auth, db = getDb();
     const [origin] = await db.select().from(messages).where(eq(messages.id, messageId.data));
@@ -121,18 +122,19 @@ export async function externalDmReplies(req: Request, res: Response) {
     // A DM is already a user-facing conversation. Normal Agent messages need
     // no external reply command. Stop at the next human input so a Web-only
     // question does not silently become an external conversation. Explicit
-    // source associations remain valid for already-prepared tasks.
+    // source associations distinguish replies to earlier inputs.
+    // Membership/system notices also use senderType=user; only chat inputs supersede.
     const [nextInput] = await db.select({ seq: messages.seq }).from(messages).where(and(
-      eq(messages.channelId, origin.channelId), eq(messages.senderType, "user"), gt(messages.seq, origin.seq),
+      eq(messages.channelId, origin.channelId), eq(messages.senderType, "user"), eq(messages.messageType, "chat"), gt(messages.seq, origin.seq),
     )).orderBy(asc(messages.seq)).limit(1);
     const replies = await db.select({ id: messages.id, seq: messages.seq, channelId: messages.channelId,
       senderId: messages.senderId, senderType: messages.senderType, content: messages.content, actionMetadata: messages.actionMetadata })
       .from(messages).where(and(eq(messages.channelId, origin.channelId), eq(messages.senderType, "agent"),
         eq(messages.senderId, agent.id), eq(messages.messageType, "chat"), gt(messages.seq, Math.max(origin.seq, parsed.data.after ?? 0)),
-        or(and(sql`${messages.actionMetadata}->>'kind' = 'external-reply'`, sql`${messages.actionMetadata}->>'messageId' = ${origin.id}`),
-          and(sql`${messages.actionMetadata}->>'kind' IS DISTINCT FROM 'external-reply'`,
+        or(and(sql`${messages.actionMetadata}->>'kind' = 'reply'`, sql`${messages.actionMetadata}->>'messageId' = ${origin.id}`),
+          and(sql`COALESCE(${messages.actionMetadata}->>'kind', '') <> 'reply'`,
             sql`NOT EXISTS (SELECT 1 FROM messages later_input
-              WHERE later_input.channel_id = ${origin.channelId} AND later_input.sender_type = 'user'
+              WHERE later_input.channel_id = ${origin.channelId} AND later_input.sender_type = 'user' AND later_input.message_type = 'chat'
               AND later_input.seq > ${origin.seq} AND later_input.seq < ${messages.seq})`)),
       )).orderBy(asc(messages.seq)).limit(100);
     const [cursor] = await db.select({ seq: agentChannelReadCursors.lastReadSeq }).from(agentChannelReadCursors)

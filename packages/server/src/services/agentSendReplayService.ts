@@ -43,9 +43,9 @@ export class AgentSendIdempotencyConflictError extends Error {
   readonly status = 409 as const;
   readonly code = "idempotency_key_reused" as const;
   readonly suggestedNextAction = "use a new idempotencyKey for different content";
-  readonly mismatch: "target" | "content" | "attachments" | "external_reply";
+  readonly mismatch: "target" | "content" | "attachments" | "reply";
 
-  constructor(mismatch: "target" | "content" | "attachments" | "external_reply") {
+  constructor(mismatch: "target" | "content" | "attachments" | "reply") {
     super(`idempotencyKey was already used for a message with a different ${mismatch}; use a new idempotencyKey for different content`);
     this.name = "AgentSendIdempotencyConflictError";
     this.mismatch = mismatch;
@@ -168,11 +168,11 @@ export async function createOrReplayAgentSend<TInserted = never>(opts: {
         throw new AgentSendIdempotencyConflictError("target");
       }
       const replyIdentity = (value: unknown) => {
-        const metadata = value as { kind?: string; messageId?: string; title?: string } | null;
-        return metadata?.kind === "external-reply" ? JSON.stringify([metadata.messageId, metadata.title ?? null]) : null;
+        const metadata = value as { kind?: string; messageId?: string } | null;
+        return metadata?.kind === "reply" ? JSON.stringify([metadata.messageId]) : null;
       };
       if (replyIdentity(replayedMessage.actionMetadata) !== replyIdentity(opts.actionMetadata)) {
-        throw new AgentSendIdempotencyConflictError("external_reply");
+        throw new AgentSendIdempotencyConflictError("reply");
       }
       if (replayedMessage.content !== content) {
         throw new AgentSendIdempotencyConflictError("content");

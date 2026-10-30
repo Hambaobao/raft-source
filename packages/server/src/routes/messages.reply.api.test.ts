@@ -25,49 +25,36 @@ async function fixture(db: Database, baseUrl: string) {
   const original = await createMessage(channel.id, "user", owner.id, "calculate the price");
   const { apiKey } = await mintAgentCredential({ agentId: agent.id, scopes: ["read", "send"], name: "external-reply-test", createdByUserId: null });
   const call = (path: string, body?: unknown, token = apiKey) => fetch(baseUrl + "/internal/agent-api" + path, { method: body === undefined ? "GET" : "POST", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-  const send = (overrides: Record<string, unknown> = {}) => call("/send", { target: `#${channel.name}`, content: "40.13", idempotencyKey: randomUUID(), externalReply: { messageId: original.id }, ...overrides });
+  const send = (overrides: Record<string, unknown> = {}) => call("/send", { target: `#${channel.name}`, content: "40.13", idempotencyKey: randomUUID(), replyTo: original.id, ...overrides });
   return { owner, server, agent, channel, original, call, send };
 }
 
-test("external replies persist plain text and canonical origin through send, history and idempotent replay", async ({ db, app }) => {
+test("native replies retain same-channel identity through history and keyed retries", async ({ db, app }) => {
   const h = await fixture(db, app.baseUrl), key = randomUUID();
-  const context = await h.call("/context");
-  assert.equal((await context.json()).features.externalReplies, true);
-  const first = await h.send({ idempotencyKey: key, externalReply: { messageId: h.original.id.slice(0, 8), title: " Price check " } });
-  const body = await first.json(); assert.equal(first.status, 200, JSON.stringify(body)); assert.ok(body.messageId);
+  assert.equal((await (await h.call("/context")).json()).features.nativeReplies, true);
+  const first = await h.send({ idempotencyKey: key, replyTo: h.original.id.slice(0, 8) });
+  const body = await first.json(); assert.equal(first.status, 200, JSON.stringify(body));
   const [stored] = await db.select().from(messages).where(eq(messages.id, body.messageId));
-  assert.equal(stored.content, "40.13");
-  assert.deepEqual(stored.actionMetadata, { kind: "external-reply", messageId: h.original.id, title: "Price check" });
+  assert.equal(stored.channelId, h.channel.id); assert.equal(stored.threadId, null);
+  assert.equal(stored.content, "40.13"); assert.deepEqual(stored.actionMetadata, { kind: "reply", messageId: h.original.id });
   const history = await h.call("/history?" + new URLSearchParams({ channel: `#${h.channel.name}`, consume: "false" }));
-  const entry = (await history.json()).messages.find((m: { id: string }) => m.id === body.messageId);
-  assert.deepEqual(entry.actionMetadata, stored.actionMetadata);
-  const replay = await h.send({ idempotencyKey: key, externalReply: { messageId: h.original.id, title: "Price check" } });
+  assert.deepEqual((await history.json()).messages.find((m: { id: string }) => m.id === body.messageId).actionMetadata, stored.actionMetadata);
+  const replay = await h.send({ idempotencyKey: key, replyTo: h.original.id });
   assert.equal(replay.status, 200); assert.equal((await replay.json()).messageId, body.messageId);
   const other = await createMessage(h.channel.id, "user", h.owner.id, "new request");
-  for (const externalReply of [{ messageId: other.id, title: "Price check" }, { messageId: h.original.id, title: "Changed" }, undefined]) {
-    const conflict = await h.send({ idempotencyKey: key, externalReply });
-    assert.equal(conflict.status, 409, JSON.stringify(await conflict.json()));
-  }
+  for (const replyTo of [other.id, undefined]) assert.equal((await h.send({ idempotencyKey: key, replyTo })).status, 409);
 });
 
-test("external replies reject invalid, hidden and cross-conversation origins without exposing them", async ({ db, app }) => {
+test("native replies reject invalid, hidden and cross-channel origins", async ({ db, app }) => {
   const h = await fixture(db, app.baseUrl);
   const other = await createChannel(h.server.id, `other-${randomUUID().slice(0, 8)}`, undefined, "private");
   await addHuman(other.id, h.owner.id);
-  const secret = await createMessage(other.id, "user", h.owner.id, "private content");
-  const hidden = await h.send({ externalReply: { messageId: secret.id } });
-  const missing = await h.send({ externalReply: { messageId: randomUUID() } });
-  assert.equal(hidden.status, 404); assert.equal(missing.status, 404);
-  assert.deepEqual(await hidden.json(), await missing.json());
+  const hiddenMessage = await createMessage(other.id, "user", h.owner.id, "private content");
+  const hidden = await h.send({ replyTo: hiddenMessage.id }), missing = await h.send({ replyTo: randomUUID() });
+  assert.equal(hidden.status, 404); assert.equal(missing.status, 404); assert.deepEqual(await hidden.json(), await missing.json());
   await addAgent(other.id, h.agent.id);
-  assert.equal((await h.send({ externalReply: { messageId: secret.id } })).status, 404);
-  for (const externalReply of [{ messageId: "not-an-id" }, { messageId: h.original.id, title: " " }, { messageId: h.original.id, title: "x".repeat(121) }, { messageId: h.original.id, unexpected: true }]) {
-    assert.equal((await h.send({ externalReply })).status, 400);
-  }
+  assert.equal((await h.send({ replyTo: hiddenMessage.id })).status, 404);
+  assert.equal((await h.send({ replyTo: "bad-id" })).status, 400);
   const { apiKey } = await mintAgentCredential({ agentId: h.agent.id, scopes: ["read"], name: "read-only", createdByUserId: null });
-  assert.equal((await h.call("/send", { target: `#${h.channel.name}`, content: "unauthorized", externalReply: { messageId: h.original.id } }, apiKey)).status, 403);
-  const plain = await h.send({ externalReply: undefined }); const result = await plain.json();
-  assert.equal(plain.status, 200);
-  const [stored] = await db.select().from(messages).where(eq(messages.id, result.messageId));
-  assert.equal(stored.actionMetadata, null);
+  assert.equal((await h.call("/send", { target: `#${h.channel.name}`, content: "denied", replyTo: h.original.id }, apiKey)).status, 403);
 });
