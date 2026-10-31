@@ -556,6 +556,15 @@ export function getAttachmentStreamingBaseUrl(
   return process.env.SERVER_URL || `${req.protocol}://${req.get("host")}`;
 }
 
+function attachmentStreamingUrlForClient(req: Request, url: URL): string {
+  // Same-origin Web requests can keep using their entry point (including an
+  // SSH tunnel) without reconstructing the public origin from proxy headers.
+  // Cross-origin Web and non-browser clients still need an absolute URL.
+  return req.get("sec-fetch-site") === "same-origin"
+    ? `${url.pathname}${url.search}`
+    : url.toString();
+}
+
 function buildAttachmentContentDispositionForRequest(req: Request, filename: string, mimeType: string | null | undefined): string {
   if (shouldUseDownloadDisposition(req)) {
     return buildAttachmentDownloadContentDisposition(filename);
@@ -1178,6 +1187,7 @@ function rejectMalformedAttachmentId(req: Request, res: Response): boolean {
 // Access is still checked per attachment: a batch must not become a way to
 // read something the caller could not read individually.
 attachmentPublicRouter.post("/urls", async (req, res) => {
+  res.vary("Sec-Fetch-Site");
   try {
     const rawIds = (req.body as { attachmentIds?: unknown })?.attachmentIds;
     if (!Array.isArray(rawIds) || rawIds.length === 0) {
@@ -1222,7 +1232,7 @@ attachmentPublicRouter.post("/urls", async (req, res) => {
       else if (queryToken) url.searchParams.set("token", queryToken);
       if (req.serverId) url.searchParams.set("serverId", req.serverId);
       url.searchParams.set("disposition", "inline");
-      return { id: attachment.id, url: url.toString(), expiresAt: null };
+      return { id: attachment.id, url: attachmentStreamingUrlForClient(req, url), expiresAt: null };
     }));
 
     res.json({ urls: results.filter((r): r is NonNullable<typeof r> => r !== null) });
@@ -1232,6 +1242,7 @@ attachmentPublicRouter.post("/urls", async (req, res) => {
 });
 
 attachmentPublicRouter.get("/:id/url", async (req, res) => {
+  res.vary("Sec-Fetch-Site");
   if (rejectMalformedAttachmentId(req, res)) return;
   try {
     const db = getDb();
@@ -1271,7 +1282,7 @@ attachmentPublicRouter.get("/:id/url", async (req, res) => {
       return;
     }
 
-    // Local storage fallback: build absolute URL to the streaming endpoint.
+    // Local storage fallback: build an authenticated streaming URL.
     // `<img src>` / new-tab downloads cannot set headers, so embed both
     // token and serverId as query params. `requireServerForFlex` accepts
     // `serverId` from the query for exactly this path, and `requireFlexAuth`
@@ -1296,7 +1307,7 @@ attachmentPublicRouter.get("/:id/url", async (req, res) => {
     } else if (shouldUseInlinePreviewDisposition(req, attachment.filename, attachment.mimeType)) {
       url.searchParams.set("disposition", "inline");
     }
-    res.json({ url: url.toString(), expiresAt: null });
+    res.json({ url: attachmentStreamingUrlForClient(req, url), expiresAt: null });
   } catch (err) {
     sendJsonServerError(req, res, { error: "Failed to get attachment URL", logPrefix: "[Attachments] Failed to url attachment", err });
   }
@@ -1373,6 +1384,7 @@ attachmentPublicRouter.get("/:id/preview", async (req, res) => {
 // the parent window. The iframe omits allow-same-origin on the client; this
 // endpoint keeps ACL checks and preview-only security headers server-side.
 attachmentPublicRouter.get("/:id/html-preview-url", async (req, res) => {
+  res.vary("Sec-Fetch-Site");
   if (rejectMalformedAttachmentId(req, res)) return;
   try {
     const db = getDb();
@@ -1398,7 +1410,7 @@ attachmentPublicRouter.get("/:id/html-preview-url", async (req, res) => {
     }
 
     const { url, expiresAt } = buildHtmlPreviewUrl(req, attachment);
-    res.json({ url: url.toString(), expiresAt });
+    res.json({ url: attachmentStreamingUrlForClient(req, url), expiresAt });
   } catch (err) {
     sendJsonServerError(req, res, { error: "Failed to get HTML preview URL", logPrefix: "[Attachments] Failed to url attachment", err });
   }

@@ -121,6 +121,109 @@ async function seedCrossServerFixture() {
   };
 }
 
+test("same-origin attachment URLs follow the browser entry point and preserve download authorization", async ({ app }) => {
+  const previousServerUrl = process.env.SERVER_URL;
+  try {
+    process.env.SERVER_URL = "https://raft.example.test:8443";
+    const { userA, userB, serverA, serverB, attachmentId } = await seedCrossServerFixture();
+    await getDb().update(attachments).set({ filename: "secret.png", mimeType: "image/png" }).where(eq(attachments.id, attachmentId));
+    const tokenB = await tokenForHuman(userB.email);
+    const bytes = Buffer.alloc(42, 65);
+    __setStorageForTests({
+      async put() {},
+      async delete() {},
+      async get() { return Readable.from([bytes]); },
+    });
+    const headers = { Authorization: `Bearer ${tokenB}`, "X-Server-Id": serverB.id };
+
+    for (const site of ["same-origin", "cross-site", "same-site", undefined]) {
+      const clientHeaders = { ...headers, ...(site ? { "Sec-Fetch-Site": site } : {}) };
+      const single = await fetch(`${app.baseUrl}/api/attachments/${attachmentId}/url?disposition=attachment`, { headers: clientHeaders });
+      assert.equal(single.status, 200);
+      assert.match(single.headers.get("vary") ?? "", /Sec-Fetch-Site/i);
+      const singleBody = await single.json() as { url: string };
+      const batch = await fetch(`${app.baseUrl}/api/attachments/urls`, {
+        method: "POST",
+        headers: { ...clientHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ attachmentIds: [attachmentId] }),
+      });
+      assert.equal(batch.status, 200);
+      assert.match(batch.headers.get("vary") ?? "", /Sec-Fetch-Site/i);
+      const batchBody = await batch.json() as { urls: Array<{ id: string; url: string }> };
+      assert.equal(batchBody.urls.length, 1);
+      assert.equal(batchBody.urls[0].id, attachmentId);
+
+      for (const [url, disposition] of [[singleBody.url, "attachment"], [batchBody.urls[0].url, "inline"]]) {
+        if (site !== "same-origin") {
+          assert.equal(new URL(url).origin, process.env.SERVER_URL);
+          continue;
+        }
+        assert.ok(url.startsWith(`/api/attachments/${attachmentId}?`));
+        // Both an HTTP SSH tunnel and an HTTPS reverse proxy keep their own origin.
+        for (const origin of ["http://127.0.0.1:38931", "https://raft.example.test:8443"]) {
+          assert.equal(new URL(url, origin).origin, origin);
+        }
+        const resolved = new URL(url, app.baseUrl);
+        assert.equal(resolved.searchParams.get("token"), tokenB);
+        assert.equal(resolved.searchParams.get("serverId"), serverB.id);
+        assert.equal(resolved.searchParams.get("disposition"), disposition);
+        const download = await fetch(resolved);
+        assert.equal(download.status, 200, "anchor/image requests need no extra auth headers");
+        assert.match(download.headers.get("content-disposition") ?? "", new RegExp(`^${disposition};`));
+        assert.deepEqual(Buffer.from(await download.arrayBuffer()), bytes);
+        resolved.searchParams.delete("token");
+        assert.equal((await fetch(resolved)).status, 401, "relative URLs still require authentication");
+      }
+    }
+
+    const deniedHeaders = {
+      Authorization: `Bearer ${await tokenForHuman(userA.email)}`,
+      "X-Server-Id": serverA.id,
+      "Sec-Fetch-Site": "same-origin",
+      "Content-Type": "application/json",
+    };
+    const denied = await fetch(`${app.baseUrl}/api/attachments/${attachmentId}/url`, { headers: deniedHeaders });
+    assert.equal(denied.status, 404);
+    const deniedBatch = await fetch(`${app.baseUrl}/api/attachments/urls`, {
+      method: "POST", headers: deniedHeaders, body: JSON.stringify({ attachmentIds: [attachmentId] }),
+    });
+    assert.deepEqual(await deniedBatch.json(), { urls: [] });
+  } finally {
+    resetStorageForTests();
+    if (previousServerUrl === undefined) delete process.env.SERVER_URL;
+    else process.env.SERVER_URL = previousServerUrl;
+  }
+});
+
+test("same-origin attachment URL requests preserve external storage signatures", async ({ app }) => {
+  try {
+    const { userB, serverB, attachmentId } = await seedCrossServerFixture();
+    const signedUrl = "https://storage.example.test/object?signature=cloud-signature";
+    __setStorageForTests({
+      async put() {},
+      async delete() {},
+      async get() { throw new Error("streaming is not expected"); },
+      async getPresignedUrl() { return signedUrl; },
+    });
+    const headers = {
+      Authorization: `Bearer ${await tokenForHuman(userB.email)}`,
+      "X-Server-Id": serverB.id,
+      "Sec-Fetch-Site": "same-origin",
+      "Content-Type": "application/json",
+    };
+    const single = await fetch(`${app.baseUrl}/api/attachments/${attachmentId}/url`, { headers });
+    assert.equal(single.status, 200);
+    assert.equal((await single.json() as { url: string }).url, signedUrl);
+    const batch = await fetch(`${app.baseUrl}/api/attachments/urls`, {
+      method: "POST", headers, body: JSON.stringify({ attachmentIds: [attachmentId] }),
+    });
+    assert.equal(batch.status, 200);
+    assert.deepEqual(await batch.json(), { urls: [{ id: attachmentId, url: signedUrl, expiresAt: null }] });
+  } finally {
+    resetStorageForTests();
+  }
+});
+
 test("attachment URL route passes the bounded five-minute TTL to storage", async ({ app }) => {
 
   try {
@@ -1484,47 +1587,51 @@ test("GET /api/attachments/:id/url two-hop flow: query-token caller gets a URL c
   );
 });
 
-test("GET /api/attachments/:id/html-preview-url returns scoped preview URL for HTML", async ({ app }) => {
-  const { userB, serverB, channelB } = await seedCrossServerFixture();
-  const db = getDb();
-  const htmlAttachmentId = "00000000-0000-4000-8000-0000000000ff";
-  await db.insert(attachments).values({
-    id: htmlAttachmentId,
-    channelId: channelB.id,
-    uploaderId: userB.id,
-    uploaderType: "user",
-    filename: "diagram.html",
-    mimeType: "application/octet-stream",
-    sizeBytes: 64,
-    storageKey: `${serverB.id}/diagram.html`,
-    thumbnailKey: null,
-    contentHash: "feedface",
+for (const site of ["same-origin", undefined]) {
+  test(`GET /api/attachments/:id/html-preview-url returns scoped preview URL for HTML (${site ?? "non-browser"})`, async ({ app }) => {
+    const { userB, serverB, channelB } = await seedCrossServerFixture();
+    const db = getDb();
+    const htmlAttachmentId = "00000000-0000-4000-8000-0000000000ff";
+    await db.insert(attachments).values({
+      id: htmlAttachmentId,
+      channelId: channelB.id,
+      uploaderId: userB.id,
+      uploaderType: "user",
+      filename: "diagram.html",
+      mimeType: "application/octet-stream",
+      sizeBytes: 64,
+      storageKey: `${serverB.id}/diagram.html`,
+      thumbnailKey: null,
+      contentHash: "feedface",
+    });
+    const tokenB = await tokenForHuman(userB.email);
+
+    const res = await fetch(`${app.baseUrl}/api/attachments/${htmlAttachmentId}/html-preview-url`, {
+      headers: {
+        Authorization: `Bearer ${tokenB}`,
+        "X-Server-Id": serverB.id,
+        ...(site ? { "Sec-Fetch-Site": site } : {}),
+      },
+    });
+    assert.equal(res.status, 200, `expected 200, got ${res.status}`);
+    const { url, expiresAt } = (await res.json()) as { url: string; expiresAt: string };
+    assert.ok(Date.parse(expiresAt) > Date.now(), "preview token should have a future expiry");
+
+    assert.equal(url.startsWith("/"), site === "same-origin");
+    const parsed = new URL(url, app.baseUrl);
+    assert.equal(parsed.pathname, `/api/attachments/${htmlAttachmentId}/html-preview`);
+    assert.equal(parsed.searchParams.get("token"), null, "must not leak the user's bearer token in iframe URL");
+    assert.ok(parsed.searchParams.get("previewToken"), "expected scoped preview token");
+    assert.notEqual(parsed.searchParams.get("previewToken"), tokenB);
+    assert.equal(parsed.searchParams.get("serverId"), serverB.id);
+
+    // Local storage is not seeded in this harness. A 404 here proves the
+    // scoped preview token got past auth and failed only at the storage layer:
+    // since #8209 a missing object is a not-found rather than a server fault.
+    const previewRes = await fetch(parsed, { redirect: "manual" });
+    assert.equal(previewRes.status, 404, `expected valid preview token to reach storage, got ${previewRes.status}`);
   });
-  const tokenB = await tokenForHuman(userB.email);
-
-  const res = await fetch(`${app.baseUrl}/api/attachments/${htmlAttachmentId}/html-preview-url`, {
-    headers: {
-      Authorization: `Bearer ${tokenB}`,
-      "X-Server-Id": serverB.id,
-    },
-  });
-  assert.equal(res.status, 200, `expected 200, got ${res.status}`);
-  const { url, expiresAt } = (await res.json()) as { url: string; expiresAt: string };
-  assert.ok(Date.parse(expiresAt) > Date.now(), "preview token should have a future expiry");
-
-  const parsed = new URL(url);
-  assert.equal(parsed.pathname, `/api/attachments/${htmlAttachmentId}/html-preview`);
-  assert.equal(parsed.searchParams.get("token"), null, "must not leak the user's bearer token in iframe URL");
-  assert.ok(parsed.searchParams.get("previewToken"), "expected scoped preview token");
-  assert.notEqual(parsed.searchParams.get("previewToken"), tokenB);
-  assert.equal(parsed.searchParams.get("serverId"), serverB.id);
-
-  // Local storage is not seeded in this harness. A 404 here proves the
-  // scoped preview token got past auth and failed only at the storage layer:
-  // since #8209 a missing object is a not-found rather than a server fault.
-  const previewRes = await fetch(url, { redirect: "manual" });
-  assert.equal(previewRes.status, 404, `expected valid preview token to reach storage, got ${previewRes.status}`);
-});
+}
 
 test("GET /api/attachments/:id/html-preview-url scoped token cannot be reused for another attachment", async ({ app }) => {
   const { userB, serverB, channelB } = await seedCrossServerFixture();
