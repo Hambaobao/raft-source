@@ -36,6 +36,7 @@ export const externalMessageInputSchema = z.object({
 export const externalMessageLookupSchema = z.object({
   externalUserId: z.string().min(1).max(256),
   readMessageIds: z.string().max(3699).transform(value => value.split(",")).pipe(z.array(z.string().uuid()).max(100)).optional(),
+  includeUserMessages: z.enum(["true", "false"]).optional(),
   after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
 }).strict();
 
@@ -133,9 +134,23 @@ export async function externalDmReplies(req: Request, res: Response) {
     const delivery = await externalInputReads(auth, origin.channelId, parsed.data.readMessageIds ?? []);
     res.json({ messageId: origin.id, channelId: origin.channelId, recipientId: user.id, coordinatorId: agent.id,
       messages: await externalReplyPresentation(await externalReplyRelations(replies, auth, origin.channelId), user.id),
+      ...(parsed.data.includeUserMessages === "true" ? { userMessages: externalNativeUserMessages(batch, user.id, user.displayName || user.name) } : {}),
       nextSeq: batch.at(-1)?.seq ?? after, hasMore: batch.length === 100, delivery });
 
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to read external DM replies", logPrefix: "external-dm.replies", err }); }
+}
+
+// Native user inputs are opt-in and restricted to the authenticated binding.
+// Never reflect an input from any external bridge, even another binding.
+export function externalNativeUserMessages<T extends {
+  id: string; seq: number; channelId: string; senderId: string; senderType: string;
+  messageType: string; content: string; actionMetadata: unknown;
+}>(batch: T[], userId: string, senderName: string) {
+  return batch.filter(message => {
+    const meta = message.actionMetadata as { kind?: unknown } | null;
+    return message.senderType === "user" && message.senderId === userId && message.messageType === "chat"
+      && (!meta || meta.kind === "message");
+  }).map(({ id, seq, channelId, senderId, senderType, content }) => ({ id, seq, channelId, senderId, senderType, senderName, content }));
 }
 
 // Only strip a leading address confirmed by Raft's durable, exact mention fact.
