@@ -10,7 +10,7 @@ import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
-import { externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema, externalReplyPresentation, externalReplyRelations, externalInputReads } from "./externalMessages";
+import { externalNativeUserMessages, externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema, externalReplyPresentation, externalReplyRelations, externalInputReads } from "./externalMessages";
 import { sendJsonServerError } from "./errorResponse";
 
 const conversationId = z.string().min(1).max(512);
@@ -113,6 +113,7 @@ export async function externalTopicMessages(req: Request, res: Response) {
       .map(m => ({ ...m, recipientMentioned: mentioned.has(m.id) }));
     const delivery = await externalInputReads(auth, channel.id, parsed.data.readMessageIds ?? [], parsed.data.externalConversationId);
     res.json({ anchorMessageId: origin.id, channelId: channel.id, recipientId: user.id, coordinatorId: agent.id,
+      ...(parsed.data.includeUserMessages === "true" ? { userMessages: externalNativeUserMessages(batch, user.id, user.displayName || user.name) } : {}),
       messages: await externalReplyPresentation(addressed, user.id), nextSeq: batch.at(-1)?.seq ?? after, hasMore: batch.length === 100, delivery });
 
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to read topic messages", logPrefix: "external-topic.messages", err }); }

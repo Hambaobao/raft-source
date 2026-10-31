@@ -271,3 +271,35 @@ test("topic read facts are exact and scoped to its bound human, agent and conver
   process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = "[]";
   assert.equal((await h.topicReplies(first.messageId, "&readMessageIds=" + second.messageId)).status, 404);
 });
+
+for (const kind of ["dm", "topic"] as const) {
+  test(`${kind} user mirroring is opt-in, native-only, bound-user-only and paginated`, async ({ db, app }) => {
+    const h = await topicFixture(db, app.baseUrl);
+    const send = kind === "dm" ? h.send : h.topicSend;
+    const replies = kind === "dm" ? h.replies : h.topicReplies;
+    const origin = await (await send()).json();
+    const native = await createMessage(origin.channelId, "user", h.owner.id, "Web **message**");
+    await send({ content: "Feishu echo" });
+    await createMessage(origin.channelId, "user", h.owner.id, "Other bridge", "chat", undefined,
+      { actionMetadata: { kind: "external-dm", bindingId: "another" } });
+    await createMessage(origin.channelId, "user", h.owner.id, "System event", "system");
+    await createMessage(origin.channelId, "user", "someone-else", "Other person");
+    await createMessage(origin.channelId, "agent", h.agent.id, "Internal agent message");
+    assert.equal((await (await replies(origin.messageId)).json()).userMessages, undefined);
+    const response = await replies(origin.messageId, "&includeUserMessages=true"), page = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(page));
+    assert.deepEqual(page.userMessages, [{ id: native.id, seq: native.seq, channelId: origin.channelId,
+      senderId: h.owner.id, senderType: "user", senderName: h.owner.displayName || h.owner.name, content: "Web **message**" }]);
+    assert.deepEqual((await (await replies(origin.messageId, "&includeUserMessages=true&after="+page.nextSeq)).json()).userMessages, []);
+    for (let i=0; i<100; i++) await createMessage(origin.channelId, "agent", h.bridge.id, "Internal");
+    const next = await createMessage(origin.channelId, "user", h.owner.id, "Later Web input");
+    const empty = await (await replies(origin.messageId, "&includeUserMessages=true&after="+page.nextSeq)).json();
+    assert.equal(empty.hasMore, true);assert.deepEqual(empty.userMessages, []);
+    const last = await (await replies(origin.messageId, "&includeUserMessages=true&after="+empty.nextSeq)).json();
+    assert.deepEqual(last.userMessages.map((m: {id:string}) => m.id), [next.id]);
+    assert.equal((await replies(native.id, "&includeUserMessages=true")).status, 404);
+    assert.equal((await replies(origin.messageId, "&includeUserMessages=garbage")).status, 400);
+    process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = "[]";
+    assert.equal((await replies(origin.messageId, "&includeUserMessages=true")).status, 404);
+  });
+}

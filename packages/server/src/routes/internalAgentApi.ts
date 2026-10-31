@@ -2477,7 +2477,7 @@ registerAgentApiRoute("agentContext", async (req, res) => {
       server: { id: server.id, slug: server.slug, name: server.name },
       credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
       prompt,
-      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true, messageBodyReads: true, messageCompletions: true, externalDmStream: true },
+      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true, messageBodyReads: true, messageCompletions: true, externalDmStream: true, externalUserMessages: true },
     });
   } catch (err) {
     sendJsonServerError(req, res, {
