@@ -292,7 +292,7 @@ export function useAttachmentPreviewBridge() {
   const buildSrc = useCallback(
     (url: string) => {
       try {
-        const u = new URL(url);
+        const u = new URL(url, window.location.href);
         u.searchParams.set("acBridgeNonce", nonce);
         u.searchParams.set("acBridgeParentOrigin", window.location.origin);
         return u.toString();
