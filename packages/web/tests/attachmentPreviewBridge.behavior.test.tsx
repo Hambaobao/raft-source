@@ -6,6 +6,19 @@ import { useAttachmentPreviewBridge } from "../src/components/message/attachment
 
 afterEach(cleanup);
 
+test("relative HTML preview URLs retain the comment bridge and current browser origin", () => {
+  const { result } = renderHook(() => useAttachmentPreviewBridge());
+  const relative = "/api/attachments/test/html-preview?previewToken=scoped&serverId=server";
+  for (const input of [relative, `https://api.example.test${relative}`]) {
+    const url = new URL(result.current.buildSrc(input));
+    assert.equal(url.origin, input.startsWith("/") ? window.location.origin : "https://api.example.test");
+    assert.equal(url.searchParams.get("previewToken"), "scoped");
+    assert.equal(url.searchParams.get("serverId"), "server");
+    assert.ok(url.searchParams.get("acBridgeNonce"));
+    assert.equal(url.searchParams.get("acBridgeParentOrigin"), window.location.origin);
+  }
+});
+
 test("each iframe load receives a fresh parent-minted document epoch", () => {
   const messages: Array<Record<string, unknown>> = [];
   const { result } = renderHook(() => useAttachmentPreviewBridge());
