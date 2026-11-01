@@ -33,7 +33,22 @@ for (const kind of ["dm", "topic"] as const) test(`external ${kind} replies pers
   assert.equal(url.searchParams.get("msg"),original.id);assert.equal(url.pathname,`/s/${h.server.slug}/${kind==="dm"?"dm":"channel"}/${first.channelId}`);
   assert.ok(stored.content.endsWith(kind==="dm"?input.content:`<@${h.agent.name}>\n${input.content}`));
   const rendered = await renderAgentReadablePermalinks(stored.content,h.server.id);
-  assert.ok(rendered.includes(`msg=${original.id.slice(0,8)}`),rendered);
+  if (kind === "dm") {
+    const referencedId = rendered.match(/raft message resolve ([0-9a-f-]+)/)?.[1];
+    assert.equal(referencedId, original.id);
+    // Exercise the entry point the Agent is actually shown, with its own
+    // credential, rather than merely checking a substring in the reference.
+    const read = await h.call(`/messages/${referencedId}/resolve`, undefined, h.leadKey.apiKey);
+    assert.equal(read.status, 200);
+    const { message } = await read.json();
+    assert.equal(message.message_id, original.id);
+    assert.equal(message.content, original.content);
+    assert.equal(message.channel_name, h.owner.name);
+    const denied = await h.call(`/messages/${referencedId}/resolve`);
+    assert.equal(denied.status, 404, "the Bridge credential cannot read the Agent's private DM");
+  } else {
+    assert.ok(rendered.includes(`msg=${original.id.slice(0,8)}`),rendered);
+  }
   assert.ok(rendered.includes("Please draft it"));
   const beforeUrl = process.env.APP_URL;
   try {

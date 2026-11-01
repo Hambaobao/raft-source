@@ -34,8 +34,11 @@ export function formatCanonicalAgentMessageRef(row: MessagePermalinkRow): string
     return `#${row.channelName} msg=${msgShort}`;
   }
 
-  if (row.channelType === "dm") {
-    return `dm:@${row.channelName} msg=${msgShort}`;
+  if (row.channelType === "dm" || (row.channelType === "thread" && row.parentChannelType === "dm")) {
+    // A DM's stored name is not its peer from every reader's perspective.
+    // Rendering is shared across recipients; resolve the exact message under
+    // the reading Agent's identity instead of guessing a dm:@ target.
+    return `DM message: \`raft message resolve ${row.messageId}\``;
   }
 
   if (!row.parentMessageId || !row.parentChannelName || !row.parentChannelType) {
@@ -43,9 +46,7 @@ export function formatCanonicalAgentMessageRef(row: MessagePermalinkRow): string
   }
 
   const parentShort = row.parentMessageId.slice(0, 8);
-  const threadTarget = row.parentChannelType === "dm"
-    ? `dm:@${row.parentChannelName}:${parentShort}`
-    : `#${row.parentChannelName}:${parentShort}`;
+  const threadTarget = `#${row.parentChannelName}:${parentShort}`;
   return `${threadTarget} msg=${msgShort}`;
 }
 

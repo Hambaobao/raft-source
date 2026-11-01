@@ -2760,7 +2760,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     () => imagePreviewAttachments.filter((att) => !isOptimisticAttachment(att)),
     [imagePreviewAttachments],
   );
-  const actionMetadata = message.actionMetadata as { kind?: string } | null | undefined;
+  const actionMetadata = message.actionMetadata as { kind?: string; replyTo?: string } | null | undefined;
   const isActionCardMessage = actionMetadata?.kind === "action-card";
   const translationTargetLanguage = translationSettings.available && translationSettings.preferredTranslationMode !== "off"
     ? translationSettings.effectiveLanguage
@@ -2833,10 +2833,6 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const generatedForwardContent = forwardedBundleMetadata
     ? `Forwarded ${forwardedItemCount} message${forwardedItemCount === 1 ? "" : "s"}`
     : null;
-  const forwardedBundleBodyContent = forwardedBundleMetadata
-    && visibleMessageContent.trim() === generatedForwardContent
-    ? ""
-    : visibleMessageContent;
   const currentHostname = typeof window !== "undefined" ? window.location.hostname : undefined;
   const quotedPermalink = useMemo(
     () => extractFirstQuotedMessagePermalink(originalMessageContent, currentHostname, serverSlug),
@@ -2847,6 +2843,20 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   const handleQuotedPermalinkUnavailable = useCallback(() => {
     if (quotedPermalink) setUnavailableQuotedPermalinkUrl(quotedPermalink.rawUrl);
   }, [quotedPermalink]);
+  const isReplyQuote = !readOnlyProjection && !!quotedPermalink
+    && (actionMetadata?.kind === "external-dm" || actionMetadata?.kind === "external-topic")
+    && actionMetadata.replyTo === quotedPermalink.parsed.messageId
+    && quotedPermalink.parsed.channelId === message.channelId
+    && originalMessageContent.startsWith(`${quotedPermalink.rawUrl}\n\n`);
+  // The reply block owns its generated link. Preserve authored links and restore
+  // the original reference when the preview is unavailable.
+  const quotePrefix = isReplyQuote && !quotedPermalinkUnavailable ? `${quotedPermalink.rawUrl}\n\n` : null;
+  const replyBodyContent = quotePrefix && visibleMessageContent.startsWith(quotePrefix)
+    ? visibleMessageContent.slice(quotePrefix.length) : visibleMessageContent;
+  const bilingualOriginalContent = quotePrefix && originalMessageContent.startsWith(quotePrefix)
+    ? originalMessageContent.slice(quotePrefix.length) : originalMessageContent;
+  const forwardedBundleBodyContent = forwardedBundleMetadata
+    && replyBodyContent.trim() === generatedForwardContent ? "" : replyBodyContent;
   // Stable so they don't break the memoized markdown body (renderContent) below.
   const handleNavigateAgent = useCallback((agentId: string) => {
     const knownAgent = senderAgent?.id === agentId
@@ -4452,6 +4462,16 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
           onJumpToHost={handleJumpToCommentHost}
           bodyFontSizeClass={messageBodyFontSizeClass}
         />
+        {isReplyQuote && quotedPermalink && !quotedPermalinkUnavailable ? (
+          <div className="mb-2">
+            <QuotedMessagePermalinkPreview
+              compact
+              permalink={quotedPermalink.parsed}
+              onOpen={handleOpenQuotedPermalink}
+              onUnavailable={handleQuotedPermalinkUnavailable}
+            />
+          </div>
+        ) : null}
         <CollapsibleMessageContent
           key={message.id}
           messageId={message.id}
@@ -4542,7 +4562,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
                 readReceiptChannelId={message.channelId}
                 readReceiptMessageSeq={message.seq}
                 readReceiptEnabled={agentReadBadgesEnabled}
-                content={message.content}
+                content={bilingualOriginalContent}
                 channels={navigableChannels}
                 mentionMap={effectiveMentionMap}
                 structuredMentionMap={effectiveStructuredMentionMap}
@@ -4583,7 +4603,7 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
             />
           </div>
         ) : null}
-        {!readOnlyProjection && quotedPermalink && !quotedPermalinkUnavailable ? (
+        {!readOnlyProjection && !isReplyQuote && quotedPermalink && !quotedPermalinkUnavailable ? (
           <div className="mt-1.5">
             <QuotedMessagePermalinkPreview
               permalink={quotedPermalink.parsed}

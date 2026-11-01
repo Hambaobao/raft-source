@@ -20,6 +20,7 @@ export function QuoteCardContent({
   members,
   currentUser,
   onOpen,
+  compact = false,
 }: {
   target: Message;
   channelArchived: boolean;
@@ -29,6 +30,7 @@ export function QuoteCardContent({
   members: ReturnType<typeof useServerStore.getState>["members"];
   currentUser: ReturnType<typeof useAuthStore.getState>["user"];
   onOpen: (permalink: ParsedRaftPermalink) => void;
+  compact?: boolean;
 }) {
   const { formatMessage } = useIntl();
   const { formatShortDateTime } = useTimeFormatter();
@@ -64,6 +66,7 @@ export function QuoteCardContent({
 
   return (
     <QuotedMessageCard
+      compact={compact}
       channelName={
         channel
           ? channel.type === "dm"
