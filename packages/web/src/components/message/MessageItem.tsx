@@ -134,6 +134,7 @@ import type { LightboxCommentContext } from "../../store/imageLightboxStore";
 import QuotedMessagePermalinkPreview from "./QuotedMessagePermalinkPreview";
 import {
   extractFirstQuotedMessagePermalink,
+  localizeExternalReplyPermalink,
   matchesUnavailableQuotedPermalink,
 } from "./quotedMessagePermalink";
 import MentionLink from "./MentionLink";
@@ -2820,7 +2821,11 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     !!translatedContent &&
     activeTranslationDisplay === "bilingual" &&
     !!message.content;
-  const visibleMessageContent = translatedContent ?? message.content ?? "";
+  const currentOrigin = typeof window !== "undefined" ? window.location.origin : undefined;
+  const originalMessageContent = localizeExternalReplyPermalink(message.content ?? "", message.actionMetadata,
+    message.channelId, serverSlug, currentOrigin);
+  const visibleMessageContent = translatedContent === null ? originalMessageContent
+    : localizeExternalReplyPermalink(translatedContent, message.actionMetadata, message.channelId, serverSlug, currentOrigin);
   const forwardedBundleMetadata = isForwardedBundleMetadata(actionMetadata) ? actionMetadata : null;
   const forwardedItemCount = Array.isArray(forwardedBundleMetadata?.forwardedItems)
     ? forwardedBundleMetadata.forwardedItems.length
@@ -2834,8 +2839,8 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     : visibleMessageContent;
   const currentHostname = typeof window !== "undefined" ? window.location.hostname : undefined;
   const quotedPermalink = useMemo(
-    () => extractFirstQuotedMessagePermalink(message.content, currentHostname, serverSlug),
-    [currentHostname, message.content, serverSlug],
+    () => extractFirstQuotedMessagePermalink(originalMessageContent, currentHostname, serverSlug),
+    [currentHostname, originalMessageContent, serverSlug],
   );
   const [unavailableQuotedPermalinkUrl, setUnavailableQuotedPermalinkUrl] = useState<string | null>(null);
   const quotedPermalinkUnavailable = quotedPermalink?.rawUrl === unavailableQuotedPermalinkUrl;

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   buildQuotedMessageAttachmentLabel,
   extractFirstQuotedMessagePermalink,
+  localizeExternalReplyPermalink,
   matchesUnavailableQuotedPermalink,
 } from "../src/components/message/quotedMessagePermalink";
 
@@ -11,6 +12,25 @@ const FIRST_PERMALINK =
   "https://app.slock.ai/s/botiverse/channel/11111111-1111-1111-1111-111111111111?msg=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const SECOND_PERMALINK =
   "https://app.slock.ai/s/botiverse/dm/22222222-2222-2222-2222-222222222222?msg=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+test("external replies use native quote previews and local navigation through SSH or HTTPS", () => {
+  for (const [kind, route] of [["external-dm", "dm"], ["external-topic", "channel"]]) {
+    const channelId = "22222222-2222-2222-2222-222222222222", replyTo = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const path = `/s/botiverse/${route}/${channelId}?msg=${replyTo}`;
+    const content = `https://memory.example:8443${path}\n\nPlease draft it`;
+    for (const origin of ["http://127.0.0.1:38931", "https://lily.example:8443"]) {
+      const localized = localizeExternalReplyPermalink(content, {kind, replyTo}, channelId, "botiverse", origin);
+      assert.equal(localized, `${origin}${path}\n\nPlease draft it`);
+      const quote = extractFirstQuotedMessagePermalink(localized, new URL(origin).hostname, "botiverse");
+      assert.equal(quote?.parsed.messageId, replyTo);assert.equal(quote?.parsed.routeKind, route);
+    }
+    for (const metadata of [null, {kind:"message",replyTo}, {kind,replyTo:"wrong"}]) {
+      assert.equal(localizeExternalReplyPermalink(content,metadata,channelId,"botiverse","http://localhost"),content);
+    }
+    assert.equal(localizeExternalReplyPermalink(content,{kind,replyTo},"other","botiverse","http://localhost"),content);
+    assert.equal(localizeExternalReplyPermalink(content,{kind,replyTo},channelId,"other","http://localhost"),content);
+  }
+});
 
 test("extracts only the first slock permalink without mutating message content", () => {
   const extracted = extractFirstQuotedMessagePermalink(

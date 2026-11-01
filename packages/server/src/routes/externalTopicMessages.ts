@@ -10,7 +10,7 @@ import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
-import { externalNativeUserMessages, externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema, externalReplyPresentation, externalReplyRelations, externalInputReads } from "./externalMessages";
+import { externalNativeUserMessages, externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema, externalReplyContent, externalReplyPresentation, externalReplyRelations, externalInputReads } from "./externalMessages";
 import { sendJsonServerError } from "./errorResponse";
 
 const conversationId = z.string().min(1).max(512);
@@ -54,6 +54,7 @@ export async function externalTopicSend(req: Request, res: Response) {
     const metadata = { kind: "external-topic", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
       recipientAgentId: agent.id, externalUserId: input.externalUserId, externalMessageId: input.externalMessageId,
       externalConversationId: input.externalConversationId, mentionRecipient: input.mentionRecipient,
+      ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       requestDigest: createHash("sha256").update(input.content).digest("hex") };
     // Recover the original rendered mention after a handle rename or lost receipt.
     const [prior] = await getDb().select().from(messages).where(and(eq(messages.randomId, randomId),
@@ -64,8 +65,10 @@ export async function externalTopicSend(req: Request, res: Response) {
         target: `#${channel.name}`, recipientId: agent.id, recipientHandle: agent.name });
       return;
     }
-    const content = input.mentionRecipient && !structuredRaftMentionStillAppears(input.content, agent.name)
+    const mentionedContent = input.mentionRecipient && !structuredRaftMentionStillAppears(input.content, agent.name)
       ? `<@${agent.name}>\n${input.content}` : input.content;
+    const content = await externalReplyContent({ ...input, content: mentionedContent }, binding.serverId, channel.id, "channel", res);
+    if (content === null) return;
     const message = await messageService.broadcastAndDeliver(req.app.get("io"), req.app.get("agentOrchestrator") as AgentOrchestrator, {
       channelId: channel.id, senderType: "user", senderId: user.id, senderName: user.displayName || user.name,
       content, randomId, actionMetadata: metadata, mentionContract: "v2",

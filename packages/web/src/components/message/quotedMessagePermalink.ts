@@ -14,6 +14,25 @@ export interface ExtractedQuotedMessagePermalink {
   parsed: ParsedRaftPermalink;
 }
 
+// An external reply's first permalink is server-generated and bound to this
+// channel. Use the browser origin so SSH forwarding and HTTPS share one quote.
+export function localizeExternalReplyPermalink(content: string, metadata: unknown, channelId: string,
+  serverSlug: string | undefined, origin: string | undefined): string {
+  if (!metadata || typeof metadata !== "object" || !origin || !serverSlug) return content;
+  const relation = metadata as { kind?: string; replyTo?: string };
+  if (!["external-dm", "external-topic"].includes(relation.kind ?? "") || !relation.replyTo) return content;
+  const firstLine = content.split("\n", 1)[0];
+  try {
+    const url = new URL(firstLine);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return content;
+    const parsed = parseRaftPermalink(firstLine, url.hostname);
+    if (!parsed || parsed.messageId !== relation.replyTo || parsed.channelId !== channelId
+      || parsed.serverSlug !== serverSlug || parsed.threadParentMessageId
+      || parsed.routeKind !== (relation.kind === "external-dm" ? "dm" : "channel")) return content;
+    return `${origin}${url.pathname}${url.search}${content.slice(firstLine.length)}`;
+  } catch { return content; }
+}
+
 export function matchesUnavailableQuotedPermalink(
   renderedHref: string,
   unavailableRawUrl: string | null | undefined,
