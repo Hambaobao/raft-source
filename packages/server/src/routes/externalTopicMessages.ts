@@ -3,9 +3,10 @@ import { isDeepStrictEqual } from "node:util";
 import { structuredRaftMentionStillAppears } from "@botiverse/raft-shared";
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { and, asc, eq, gt, inArray } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { getDb } from "../db/index";
-import { channelAgents, messages, messageMentions } from "../db/schema";
+import { channels, channelAgents, messages, messageMentions } from "../db/schema";
 import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
@@ -16,6 +17,7 @@ import { sendJsonServerError } from "./errorResponse";
 const conversationId = z.string().min(1).max(512);
 const inputSchema = externalMessageInputSchema.extend({ externalConversationId: conversationId, mentionRecipient: z.boolean() });
 const lookupSchema = externalMessageLookupSchema.extend({ externalConversationId: conversationId, anchorMessageId: z.string().uuid(),
+  includeThreadMessages: z.enum(["true", "false"]).optional(),
   readMessageIds: z.string().max(3699).transform(value => value.split(",")).pipe(z.array(z.string().uuid()).max(100)).optional(),
 });
 function unavailable(res: Response) { res.status(404).json({ code: "external_topic_unavailable" }); }
@@ -101,17 +103,31 @@ export async function externalTopicMessages(req: Request, res: Response) {
     // This anchor proves the external conversation binding; it is not the question
     // being answered. Scan every channel message so internal-only pages advance too.
     const after = Math.max(origin.seq, parsed.data.after ?? 0);
-    const batch = await db.select({ id: messages.id, seq: messages.seq, channelId: messages.channelId,
+    // Direct threads inherit this private channel's read authority. Verify both
+    // the stored parent channel and the root message, never an arbitrary ID
+    // supplied by the Bridge. Keep one global-seq cursor across the whole stream.
+    const parent = alias(messages, "external_thread_parent");
+    const rows = await db.select({ id: messages.id, seq: messages.seq, channelId: messages.channelId,
       senderId: messages.senderId, senderType: messages.senderType, content: messages.content,
-      messageType: messages.messageType, actionMetadata: messages.actionMetadata })
-      .from(messages).where(and(eq(messages.channelId, channel.id), gt(messages.seq, after)))
+      messageType: messages.messageType, actionMetadata: messages.actionMetadata, parentMessageId: parent.id })
+      .from(messages).innerJoin(channels, eq(channels.id, messages.channelId))
+      .leftJoin(parent, eq(parent.id, channels.parentMessageId))
+      .where(and(gt(messages.seq, after), or(eq(messages.channelId, channel.id),
+        parsed.data.includeThreadMessages === "true" ? and(eq(channels.type, "thread"),
+          eq(channels.serverId, binding.serverId), isNull(channels.deletedAt),
+          eq(channels.parentChannelId, channel.id), eq(parent.channelId, channel.id)) : undefined)))
       .orderBy(asc(messages.seq)).limit(100);
+    const batch = rows.map(({ parentMessageId, ...message }) => ({ ...message,
+      ...(message.channelId !== channel.id ? { thread: { parentChannelId: channel.id, parentMessageId: parentMessageId! } } : {}) }));
     const candidates = batch.filter(m => m.senderType === "agent" && m.senderId === agent.id && m.messageType === "chat");
     const mentions = candidates.length ? await db.select({ messageId: messageMentions.messageId }).from(messageMentions)
       .where(and(inArray(messageMentions.messageId, candidates.map(m => m.id)), eq(messageMentions.targetType, "user"),
         eq(messageMentions.targetId, user.id), eq(messageMentions.confidence, "exact"), eq(messageMentions.notifiableAtSend, true))) : [];
     const mentioned = new Set(mentions.map(m => m.messageId));
-    const related = await externalReplyRelations(candidates, auth, channel.id, parsed.data.externalConversationId);
+    const related = (await Promise.all([...new Set(candidates.map(m => m.channelId))].map(id => {
+      const source = candidates.filter(m => m.channelId === id);
+      return externalReplyRelations(source, auth, id, parsed.data.externalConversationId, source[0]?.thread?.parentMessageId);
+    }))).flat().sort((a, b) => a.seq - b.seq);
     const addressed = related.filter(m => mentioned.has(m.id) || m.recipientReplyTo)
       .map(m => ({ ...m, recipientMentioned: mentioned.has(m.id) }));
     const delivery = await externalInputReads(auth, channel.id, parsed.data.readMessageIds ?? [], parsed.data.externalConversationId);
