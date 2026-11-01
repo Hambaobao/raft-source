@@ -29,7 +29,7 @@ test("formatCanonicalAgentMessageRef uses target+msg for regular channels", () =
   );
 });
 
-test("formatCanonicalAgentMessageRef uses DM target+msg for DM messages", () => {
+test("DM references use an exact read command without guessing the reader's peer", () => {
   assert.equal(
     formatCanonicalAgentMessageRef({
       messageId: "7556f881-a5f8-4b0d-88dc-8b5af28e8f05",
@@ -39,8 +39,17 @@ test("formatCanonicalAgentMessageRef uses DM target+msg for DM messages", () => 
       parentChannelName: null,
       parentChannelType: null,
     }),
-    "dm:@richard msg=7556f881",
+    "DM message: `raft message resolve 7556f881-a5f8-4b0d-88dc-8b5af28e8f05`",
   );
+});
+
+test("DM thread references also resolve the exact reply without a guessed parent target", () => {
+  assert.equal(formatCanonicalAgentMessageRef({
+    messageId: "7556f881-a5f8-4b0d-88dc-8b5af28e8f05",
+    channelName: "thread-a1b2c3d4", channelType: "thread",
+    parentMessageId: "a1b2c3d4-1111-2222-3333-444444444444",
+    parentChannelName: "tibo", parentChannelType: "dm",
+  }), "DM message: `raft message resolve 7556f881-a5f8-4b0d-88dc-8b5af28e8f05`");
 });
 
 test("formatCanonicalAgentMessageRef uses thread target plus msg for thread replies", () => {

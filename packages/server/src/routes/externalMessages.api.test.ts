@@ -11,11 +11,69 @@ import { createAgent, assignMachine } from "../services/agentService";
 import { registerMachine } from "../services/machineService";
 import { findOrCreateDM, canAgentAccessChannel, createChannel, addAgent, addHuman } from "../services/channelService";
 import { createMessage } from "../services/messageService";
+import { renderAgentReadablePermalinks } from "../services/agentPermalinkRenderService";
 import { mintAgentCredential } from "../services/agentCredentialService";
 import type { Database } from "../db/index";
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 const originalBindings = process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS;
 afterEach(() => { if (originalBindings === undefined) delete process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS; else process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = originalBindings; });
+
+for (const kind of ["dm", "topic"] as const) test(`external ${kind} replies persist native quotes for Web and Agent reads and survive retries`, async ({ db, app }) => {
+  const h = await topicFixture(db, app.baseUrl);
+  const send = kind === "dm" ? h.send : h.topicSend;
+  const first = await (await send()).json();
+  const original = await createMessage(first.channelId, "agent", h.agent.id, "I can draft the guidelines");
+  const input = { externalMessageId: "quoted", content: "Please draft it", replyTo: original.id, mentionRecipient: true };
+  const body = kind === "dm" ? { externalMessageId: input.externalMessageId, content: input.content, replyTo: input.replyTo } : input;
+  const response = await send(body), receipt = await response.json();assert.equal(response.status,200,JSON.stringify(receipt));
+  const [stored] = await db.select().from(messages).where(eq(messages.id,receipt.messageId));
+  assert.equal(stored.threadId,null);assert.equal(stored.senderId,h.owner.id);
+  assert.equal((stored.actionMetadata as {replyTo:string}).replyTo,original.id);
+  const url = new URL(stored.content.split("\n")[0]);
+  assert.equal(url.searchParams.get("msg"),original.id);assert.equal(url.pathname,`/s/${h.server.slug}/${kind==="dm"?"dm":"channel"}/${first.channelId}`);
+  assert.ok(stored.content.endsWith(kind==="dm"?input.content:`<@${h.agent.name}>\n${input.content}`));
+  const rendered = await renderAgentReadablePermalinks(stored.content,h.server.id);
+  if (kind === "dm") {
+    const referencedId = rendered.match(/raft message resolve ([0-9a-f-]+)/)?.[1];
+    assert.equal(referencedId, original.id);
+    // Exercise the entry point the Agent is actually shown, with its own
+    // credential, rather than merely checking a substring in the reference.
+    const read = await h.call(`/messages/${referencedId}/resolve`, undefined, h.leadKey.apiKey);
+    assert.equal(read.status, 200);
+    const { message } = await read.json();
+    assert.equal(message.message_id, original.id);
+    assert.equal(message.content, original.content);
+    assert.equal(message.channel_name, h.owner.name);
+    const denied = await h.call(`/messages/${referencedId}/resolve`);
+    assert.equal(denied.status, 404, "the Bridge credential cannot read the Agent's private DM");
+  } else {
+    assert.ok(rendered.includes(`msg=${original.id.slice(0,8)}`),rendered);
+  }
+  assert.ok(rendered.includes("Please draft it"));
+  const beforeUrl = process.env.APP_URL;
+  try {
+    process.env.APP_URL="https://changed.example";
+    const replay=await send(body);assert.equal(replay.status,200);assert.equal((await replay.json()).messageId,receipt.messageId);
+  } finally { if(beforeUrl===undefined)delete process.env.APP_URL;else process.env.APP_URL=beforeUrl; }
+  assert.equal((await send({...body,replyTo:first.messageId})).status,409);
+  assert.equal((await send({...body,content:"changed"})).status,409);
+  assert.equal((await send({...body,replyTo:undefined})).status,409);
+  const another = await send({replyTo:first.messageId});assert.equal(another.status,200);
+});
+
+test("external quotes reject missing, cross-channel, system and malformed targets without sending",async({db,app})=>{
+  const h=await topicFixture(db,app.baseUrl);
+  const dm=await (await h.send()).json(),topic=await (await h.topicSend()).json();
+  const system=await createMessage(topic.channelId,"user","system","Internal event","system");
+  const before=await db.select({id:messages.id}).from(messages);
+  assert.equal((await h.send({replyTo:topic.messageId})).status,404);
+  assert.equal((await h.topicSend({replyTo:dm.messageId})).status,404);
+  assert.equal((await h.topicSend({replyTo:system.id})).status,404);
+  assert.equal((await h.send({replyTo:randomUUID()})).status,404);
+  assert.equal((await h.send({replyTo:"bad"})).status,400);
+  assert.equal((await h.topicSend({replyTo:"bad"})).status,400);
+  assert.equal((await db.select({id:messages.id}).from(messages)).length,before.length);
+});
 async function fixture(db: Database, baseUrl: string) {
   const suffix = randomUUID().slice(0, 8);
   const [owner] = await db.insert(users).values({ email: `dm-${suffix}@raft.test`, name: `owner-${suffix}`, passwordHash: await fixturePasswordHash("password123"), emailVerified: true }).returning();

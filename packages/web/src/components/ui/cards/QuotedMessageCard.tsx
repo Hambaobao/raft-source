@@ -38,6 +38,7 @@ export interface QuotedMessageCardProps {
   attachments?: { label: string }[];
   onClick?: () => void;
   unavailable?: boolean;
+  compact?: boolean;
 }
 
 export function Tag({
@@ -91,6 +92,7 @@ export default function QuotedMessageCard({
   attachments,
   onClick,
   unavailable = false,
+  compact = false,
 }: QuotedMessageCardProps) {
   const intl = useIntl();
   if (unavailable) {
@@ -103,6 +105,18 @@ export default function QuotedMessageCard({
       </PreviewShell>
     );
   }
+
+  if (compact) return (
+    <PreviewShell onClick={onClick} data-testid="quoted-message-card" className="group block w-full px-3 py-2 text-left">
+      <MessageQuotedPreviewAuthor className="mb-0.5 flex min-w-0 items-center gap-1.5">
+        <CompactUserAvatar author={author} />
+        <MessageQuotedPreviewAuthorName className="min-w-0 truncate">{author.name}</MessageQuotedPreviewAuthorName>
+      </MessageQuotedPreviewAuthor>
+      <MessageQuotedPreviewText className="line-clamp-2">
+        <InlineMarkdownPreview markdown={content || attachments?.map(attachment => attachment.label).join(" · ") || ""} />
+      </MessageQuotedPreviewText>
+    </PreviewShell>
+  );
 
   return (
     <PreviewShell onClick={onClick} data-testid="quoted-message-card" className="group block w-full text-left">

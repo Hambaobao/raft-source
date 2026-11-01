@@ -19,10 +19,12 @@ export default function QuotedMessagePermalinkPreview({
   permalink,
   onOpen,
   onUnavailable,
+  compact = false,
 }: {
   permalink: ParsedRaftPermalink;
   onOpen: (permalink: ParsedRaftPermalink) => void;
   onUnavailable?: () => void;
+  compact?: boolean;
 }) {
   const [state, setState] = useState<PreviewState>({ status: "loading" });
   const channels = useChannelStore((s) => s.channels);
@@ -72,6 +74,12 @@ export default function QuotedMessagePermalinkPreview({
   );
 
   if (state.status === "loading") {
+    if (compact) return (
+      <Card className="w-full space-y-1 px-3 py-2" aria-busy="true">
+        <Skeleton variant="line" className="w-24" />
+        <Skeleton variant="line" className="w-3/4" />
+      </Card>
+    );
     return (
       <Card className="w-full">
         <div className="h-[34px] border-b border-line-hairline" />
@@ -93,6 +101,7 @@ export default function QuotedMessagePermalinkPreview({
 
   return (
     <QuoteCardContent
+      compact={compact}
       target={state.target}
       channelArchived={state.channelArchived}
       channel={channel}
