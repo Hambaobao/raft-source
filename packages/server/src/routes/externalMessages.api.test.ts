@@ -364,7 +364,9 @@ for (const kind of ["dm", "topic"] as const) {
 
 
 test("topic threads relay addressed coordinator messages with native user sync and round-trip quotes", async ({ db, app }) => {
-  const h = await topicFixture(db, app.baseUrl), origin = await (await h.topicSend({externalMessageId:"thread-root"})).json();
+  const h = await topicFixture(db, app.baseUrl);
+  const rootText="讨论方案调整 "+"🧭".repeat(45);
+  const origin = await (await h.topicSend({externalMessageId:"thread-root",content:`<@${h.agent.name}>\n${rootText}`})).json();
   const thread = await getOrCreateThread(origin.messageId, h.agent.id, "agent");
   const target = `#${h.channel.name}:${origin.messageId.slice(0,8)}`;
   const send = async (content: string, extra = {}) => {
@@ -386,12 +388,20 @@ test("topic threads relay addressed coordinator messages with native user sync a
   assert.deepEqual(page.messages.map((m:{content:string})=>m.content),[`@${h.owner.name} thread update`,"Answer to thread input","Root answer",`@${h.owner.name} main update`]);
   for(const message of page.messages.slice(0,3)) {
     assert.equal(message.channelId,thread.id);
-    assert.deepEqual(message.thread,{parentChannelId:h.channel.id,parentMessageId:origin.messageId});
+    assert.equal(message.thread.parentChannelId,h.channel.id);assert.equal(message.thread.parentMessageId,origin.messageId);
+    assert.equal(message.thread.title,Array.from(rootText).slice(0,40).join("")+"…");
+    const link=new URL(message.thread.url);
+    assert.equal(link.pathname,`/s/${h.server.slug}/channel/${h.channel.id}`);
+    assert.equal(link.searchParams.get("msg"),message.id);
+    assert.equal(link.searchParams.get("thread"),`${h.channel.id}:${origin.messageId}`);
   }
   assert.equal(page.messages[0].recipientMentioned,true);
   assert.equal(page.messages[1].quote.messageId,native.id);
   assert.deepEqual(page.messages[2].completedInputs,[{messageId:origin.messageId,externalMessageId:"thread-root"}]);
   assert.equal(page.userMessages.length,1);assert.equal(page.userMessages[0].id,native.id);assert.equal(page.userMessages[0].thread.parentChannelId,h.channel.id);
+  assert.equal(page.userMessages[0].thread.title,page.messages[0].thread.title);
+  assert.equal(new URL(page.userMessages[0].thread.url).searchParams.get("msg"),native.id);
+  assert.equal(page.messages.at(-1).thread,undefined);
   const mirrored = page.messages[0];
   const reply = await h.topicSend({content:"Reply from Feishu",replyTo:mirrored.id}), receipt = await reply.json();
   assert.equal(reply.status,200,JSON.stringify(receipt));
@@ -440,4 +450,14 @@ test("topic threads advance a shared cursor across internal pages without skippi
   assert.equal(second.hasMore,false);assert.deepEqual(second.messages.map((m:{channelId:string})=>m.channelId),[h.channel.id,thread.id]);
   const third=await (await h.topicReplies(origin.messageId,`&includeThreadMessages=true&after=${second.nextSeq}`)).json();
   assert.deepEqual(third.messages,[]);assert.equal(third.nextSeq,second.nextSeq);
+});
+
+
+test("topic thread context falls back to a short label when the root has only mentions and links",async({db,app})=>{
+  const h=await topicFixture(db,app.baseUrl),origin=await (await h.topicSend({content:`<@${h.agent.name}>\nhttps://example.invalid/original`})).json();
+  await getOrCreateThread(origin.messageId,h.agent.id,"agent");
+  const r=await h.call("/send",{target:`#${h.channel.name}:${origin.messageId.slice(0,8)}`,content:`@${h.owner.name} update`},h.leadKey.apiKey);
+  assert.equal(r.status,200,JSON.stringify(await r.json()));
+  const page=await (await h.topicReplies(origin.messageId,"&includeThreadMessages=true")).json();
+  assert.equal(page.messages[0].thread.title,"原讨论");
 });

@@ -185,7 +185,7 @@ export async function externalDmReplies(req: Request, res: Response) {
 export function externalNativeUserMessages<T extends {
   id: string; seq: number; channelId: string; senderId: string; senderType: string;
   messageType: string; content: string; actionMetadata: unknown;
-  thread?: { parentChannelId: string; parentMessageId: string };
+  thread?: { parentChannelId: string; parentMessageId: string; title: string; url: string };
 }>(batch: T[], userId: string, senderName: string) {
   return batch.filter(message => {
     const meta = message.actionMetadata as { kind?: unknown } | null;

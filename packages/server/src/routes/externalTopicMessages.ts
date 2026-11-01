@@ -9,6 +9,8 @@ import { getDb } from "../db/index";
 import { channels, channelAgents, messages, messageMentions } from "../db/schema";
 import * as channelService from "../services/channelService";
 import * as messageService from "../services/messageService";
+import { getServer } from "../services/serverService";
+import { getAppUrl } from "../config/appUrl";
 import { isChannelReadOnlyByQuota, isChannelReadOnlyByBillingFeature } from "../services/planService";
 import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import { externalNativeUserMessages, externalMessageAuthority, externalMessageInputSchema, externalMessageLookupSchema, externalReplyContent, externalReplyPresentation, externalReplyRelations, externalInputReads } from "./externalMessages";
@@ -109,7 +111,7 @@ export async function externalTopicMessages(req: Request, res: Response) {
     const parent = alias(messages, "external_thread_parent");
     const rows = await db.select({ id: messages.id, seq: messages.seq, channelId: messages.channelId,
       senderId: messages.senderId, senderType: messages.senderType, content: messages.content,
-      messageType: messages.messageType, actionMetadata: messages.actionMetadata, parentMessageId: parent.id })
+      messageType: messages.messageType, actionMetadata: messages.actionMetadata, parentMessageId: parent.id, parentContent: parent.content })
       .from(messages).innerJoin(channels, eq(channels.id, messages.channelId))
       .leftJoin(parent, eq(parent.id, channels.parentMessageId))
       .where(and(gt(messages.seq, after), or(eq(messages.channelId, channel.id),
@@ -117,8 +119,20 @@ export async function externalTopicMessages(req: Request, res: Response) {
           eq(channels.serverId, binding.serverId), isNull(channels.deletedAt),
           eq(channels.parentChannelId, channel.id), eq(parent.channelId, channel.id)) : undefined)))
       .orderBy(asc(messages.seq)).limit(100);
-    const batch = rows.map(({ parentMessageId, ...message }) => ({ ...message,
-      ...(message.channelId !== channel.id ? { thread: { parentChannelId: channel.id, parentMessageId: parentMessageId! } } : {}) }));
+    const server = rows.some(m => m.channelId !== channel.id) ? await getServer(binding.serverId) : null;
+    const batch = rows.map(({ parentMessageId, parentContent, ...message }) => {
+      if (message.channelId === channel.id) return { ...message, thread: undefined };
+      if (!server || !parentMessageId) throw new Error("EXTERNAL_THREAD_CONTEXT_UNAVAILABLE");
+      // A bounded excerpt, not a generated summary. Omit leading addresses and
+      // URLs (including generated quote links) so the discussion text is visible.
+      const excerpt = Array.from((parentContent ?? "").replace(/<@[^>]+>/gu, "")
+        .replace(/https?:\/\/\S+/gu, "").replace(/\s+/gu, " ").trim().replace(/^(?:@[\p{L}\p{N}_.-]+\s+)+/u, ""));
+      const title = excerpt.slice(0, 40).join("") + (excerpt.length > 40 ? "…" : "");
+      const url = new URL(`${getAppUrl()}/s/${encodeURIComponent(server.slug)}/channel/${channel.id}`);
+      url.searchParams.set("msg", message.id);
+      url.searchParams.set("thread", `${channel.id}:${parentMessageId}`);
+      return { ...message, thread: { parentChannelId: channel.id, parentMessageId, title: title || "原讨论", url: url.toString() } };
+    });
     const candidates = batch.filter(m => m.senderType === "agent" && m.senderId === agent.id && m.messageType === "chat");
     const mentions = candidates.length ? await db.select({ messageId: messageMentions.messageId }).from(messageMentions)
       .where(and(inArray(messageMentions.messageId, candidates.map(m => m.id)), eq(messageMentions.targetType, "user"),
