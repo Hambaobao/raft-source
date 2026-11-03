@@ -1,3 +1,4 @@
+import { externalAttachmentFiles, externalAttachmentMetadata, uploadExternalMessageAttachments, respondExternalAttachmentError } from "./externalMessageAttachments";
 import type { Request, Response } from "express";
 import { isDeepStrictEqual } from "node:util";
 import { structuredRaftMentionStillAppears } from "@botiverse/raft-shared";
@@ -52,10 +53,11 @@ export async function externalTopicSend(req: Request, res: Response) {
     if (await isChannelReadOnlyByQuota(channel.id, req.serverId!) || await isChannelReadOnlyByBillingFeature(channel.id, req.serverId!)) {
       res.status(403).json({ code: "external_topic_read_only" }); return;
     }
+    const files = externalAttachmentFiles(req);
     const randomId = "external-message-" + createHash("sha256").update(JSON.stringify([
       binding.serverId, binding.bridgeAgentId, binding.id, input.externalMessageId,
     ])).digest("hex");
-    const metadata = { kind: "external-topic", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
+    const metadata = { ...externalAttachmentMetadata(files), kind: "external-topic", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
       recipientAgentId: agent.id, externalUserId: input.externalUserId, externalMessageId: input.externalMessageId,
       externalConversationId: input.externalConversationId, mentionRecipient: input.mentionRecipient,
       ...(input.replyTo ? { replyTo: input.replyTo } : {}),
@@ -73,14 +75,17 @@ export async function externalTopicSend(req: Request, res: Response) {
       ? `<@${agent.name}>\n${input.content}` : input.content;
     const content = await externalReplyContent({ ...input, content: mentionedContent }, binding.serverId, channel.id, "channel", res);
     if (content === null) return;
+    const attachmentIds = await uploadExternalMessageAttachments(req, res, channel.id, user.id, files);
+    if (attachmentIds === null) return;
     const message = await messageService.broadcastAndDeliver(req.app.get("io"), req.app.get("agentOrchestrator") as AgentOrchestrator, {
       channelId: channel.id, senderType: "user", senderId: user.id, senderName: user.displayName || user.name,
-      content, randomId, actionMetadata: metadata, mentionContract: "v2",
+      content, randomId, actionMetadata: metadata, attachmentIds, mentionContract: "v2",
       ...(input.mentionRecipient ? { mentions: [{ type: "agent", id: agent.id, name: agent.name }] } : {}),
     });
     res.json({ messageId: message.id, messageSeq: message.seq, channelId: channel.id,
       target: `#${channel.name}`, recipientId: agent.id, recipientHandle: agent.name });
   } catch (err) {
+    if (await respondExternalAttachmentError(req, res, err)) return;
     if (err instanceof messageService.UserRandomIdConflictError) { res.status(409).json({ code: err.code }); return; }
     if (err instanceof channelService.ChannelArchivedError) { res.status(409).json({ code: "channel_archived" }); return; }
     sendJsonServerError(req, res, { error: "Failed to send external topic message", logPrefix: "external-topic.send", err });
