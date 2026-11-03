@@ -151,3 +151,18 @@ test("requestDaemonScopeAttestation classifies an HTML 413 from the server as 41
     /Failed to request daemon scope attestation \(413\)/,
   );
 });
+
+import {vi} from 'vitest';
+test('diagnostic upload opt-out blocks the shared feedback/trace data plane before signing, without blocking other uploads',async()=>{
+ const calls:string[]=[];
+ const fetchImpl=async(url:string)=>{calls.push(url);return jsonResponse({attestation:'synthetic-token',scope:'attachment:create',audience:'receiver',resource:'file',expiresAt:'2099-01-01T00:00:00Z',upload:{method:'PUT',url:'http://storage.test/file'}});};
+ const options={serverUrl:'http://server.test',apiKey:'synthetic-key',workerUrl:'http://receiver.test',scope:'daemon-trace-bundle:create',createBody:{},uploadBody:new Blob(['synthetic content']),fetchImpl};
+ try {
+  vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_DISABLED','1');
+  await assert.rejects(uploadWithSignedCapability(options),/DIAGNOSTIC_UPLOAD_DISABLED/);
+  assert.deepEqual(calls,[]);
+  await uploadWithSignedCapability({...options,scope:'attachment:create'});assert.equal(calls.length,3);
+  calls.length=0;vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_DISABLED','0');
+  await assert.rejects(uploadWithSignedCapability({...options,workerUrl:''}),/DIAGNOSTIC_UPLOAD_DISABLED/);assert.deepEqual(calls,[]);
+ }finally{vi.unstubAllEnvs();}
+});

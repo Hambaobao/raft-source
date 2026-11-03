@@ -1,3 +1,4 @@
+import { resolveDiagnosticUploadUrl } from "@botiverse/raft-shared";
 import { createHash, randomUUID } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import {
@@ -170,6 +171,12 @@ export async function collectFeedbackTranscriptAttachment(input: {
   tracer: Tracer;
   fetchImpl: FetchLike;
 }): Promise<FeedbackTranscriptCollectionResult> {
+  if (!resolveDiagnosticUploadUrl(process.env, input.workerUrl)) {
+    return { reachable: false, fallbackReason: "Diagnostic uploads are disabled or no receiver is configured", outcomeVersion: 1,
+      lookup: { reachable: false, content: "absent", reasonCode: null, runtime: null, lookupMethod: null,
+        workspaceDirPresent: null, sourceBytes: null, transcriptBytes: null, selectionBasis: "lookup_time" },
+      upload: { status: "not_attempted", reason: "worker_not_configured", ...NOT_ATTEMPTED } };
+  }
   const transcriptResult = await input.getSessionTranscript();
   // Only bytes the reader itself classified as the runtime's own file are
   // ever uploaded. A placeholder, or bytes whose kind nobody decided, are not.

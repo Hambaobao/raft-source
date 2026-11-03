@@ -1026,6 +1026,9 @@ function withDefaultParent(tracer: ComputerTracer, parent: ComputerTraceContext)
 }
 
 function formatMigrationDiagnosticsResult(result: DiagnosticsPushResult): string {
+  if (result.status === "failed" && result.reason === "UPLOAD_DISABLED") {
+    return result.localBundle ? `Migration diagnostics saved locally: ${result.localBundle.path}` : "Migration diagnostic upload is disabled.";
+  }
   if (result.status === "failed") {
     return `Migration diagnostics: forced upload failed (${result.reason}).`;
   }

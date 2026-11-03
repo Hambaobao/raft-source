@@ -1,3 +1,4 @@
+import { resolveDiagnosticUploadUrl } from "@botiverse/raft-shared";
 import type { AgentApiHistoryConsumptionScope } from "@botiverse/raft-shared";
 import { finishToolCall, noteToolCallStart } from "./toolCallOutcome";
 import { TurnSummaryTracker, turnOutcomeForActivity, turnTriggerFromMessages } from "./turnSummaryTracker";
@@ -7991,7 +7992,7 @@ export class AgentProcessManager {
 
   /** Whether this daemon can upload feedback attachments at all (worker URL configured). */
   get feedbackUploadsConfigured(): boolean {
-    return Boolean(this.workerUrl);
+    return Boolean(resolveDiagnosticUploadUrl(process.env, this.workerUrl));
   }
 
   /**
@@ -8005,7 +8006,7 @@ export class AgentProcessManager {
     result: FeedbackTranscriptCollectionResult,
     daemonVersion: string | null,
   ): Promise<FeedbackTranscriptOutcomeUploadStatus | "not_attempted"> {
-    if (!this.workerUrl) return Promise.resolve("not_attempted");
+    if (!this.workerUrl || !resolveDiagnosticUploadUrl(process.env, this.workerUrl)) return Promise.resolve("not_attempted");
     return uploadFeedbackTranscriptOutcome({
       result,
       agentId,
@@ -8031,7 +8032,7 @@ export class AgentProcessManager {
     requestId: string,
     reportGeneratedAt: string,
   ): Promise<FeedbackAgentEventTailOutcome | "not_attempted"> {
-    if (!this.workerUrl) return Promise.resolve("not_attempted");
+    if (!this.workerUrl || !resolveDiagnosticUploadUrl(process.env, this.workerUrl)) return Promise.resolve("not_attempted");
     return startFeedbackAgentEventTail({
       agentId,
       feedbackReportId,

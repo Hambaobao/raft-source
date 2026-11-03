@@ -4883,3 +4883,5 @@ export * from "./providerRequestActivity";
 export * from "./appWhenToUse";
 
 export * from "./raftbenchContract";
+
+export { resolveDiagnosticUploadUrl } from "./diagnosticUploadPolicy.js";

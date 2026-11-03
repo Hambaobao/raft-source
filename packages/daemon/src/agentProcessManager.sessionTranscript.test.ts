@@ -608,9 +608,10 @@ test("collectFeedbackTranscript returns fallback when worker URL is not configur
     const reportId = "report-no-worker";
     const result = await manager.collectFeedbackTranscript("agent-1", reportId);
 
-    assert.equal(result.reachable, true);
+    assert.equal(result.reachable, false, "disabled feedback does not read the session");
     assert.equal(result.traceBundleId, undefined);
-    assert.ok(result.fallbackReason?.includes("worker URL") || result.fallbackReason?.includes("not configured"));
+    assert.equal(result.upload?.status, "not_attempted");
+    assert.ok(result.fallbackReason?.includes("no receiver"));
   });
 });
 
@@ -747,4 +748,21 @@ test("collectFeedbackTranscript returns error when upload fails", async () => {
     },
     { workerUrl: "https://worker.example.com", fetchImpl },
   );
+});
+
+import {vi} from 'vitest';
+test('manager respects opt-out for transcript, outcome and agent-event-tail despite a configured receiver',async()=>{
+ let requests=0,reads=0;
+ try {
+  vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_DISABLED','1');
+  await withManager(async ({manager})=>{
+   manager.getSessionTranscript=async()=>{reads++;throw new Error('must not read');};
+   assert.equal(manager.feedbackUploadsConfigured,false);
+   const result=await manager.collectFeedbackTranscript('agent','report',undefined,{includeMachineLogTail:true});
+   assert.equal(result.upload?.status,'not_attempted');assert.equal(reads,0);
+   assert.equal(await manager.uploadFeedbackTranscriptOutcome('agent','report','request',result,null),'not_attempted');
+   assert.equal(await manager.uploadFeedbackAgentEventTail('agent','report','request','2026-11-03T00:00:00Z'),'not_attempted');
+  },{workerUrl:'http://receiver.test',fetchImpl:(async()=>{requests++;return new Response(JSON.stringify({attestation:'synthetic-signature'}));}) as typeof fetch});
+  assert.equal(requests,0);
+ }finally{vi.unstubAllEnvs();}
 });

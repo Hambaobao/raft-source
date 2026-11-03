@@ -1,3 +1,4 @@
+import { resolveDiagnosticUploadUrl } from "@botiverse/raft-shared";
 import { executeJsonRequest, executeResponseRequest, ChatBridgeToolTimeoutError, DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS, HttpStatusError } from "./chatBridgeRequest";
 import { daemonFetch } from "./daemonFetch";
 
@@ -165,6 +166,11 @@ export async function createDirectUploadSession<TResponse extends DirectUploadCr
   timeoutMs = DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS,
   signal,
 }: CreateDirectUploadSessionOptions<TResponse>): Promise<{ capability: DaemonScopeAttestation; response: TResponse }> {
+  // Covers trace bundles and every feedback attachment, including callers
+  // retaining an old worker URL. Other signed uploads use independent scopes.
+  if (scope === "daemon-trace-bundle:create" && !resolveDiagnosticUploadUrl(process.env, workerUrl)) {
+    throw new Error("DIAGNOSTIC_UPLOAD_DISABLED");
+  }
   const capability = await requestDaemonScopeAttestation({
     serverUrl,
     apiKey,
