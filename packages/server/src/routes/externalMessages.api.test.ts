@@ -1,11 +1,13 @@
+import { Readable } from "node:stream";
+import { __setStorageForTests, __setCdnStorageForTests, resetStorageForTests, type StorageBackend } from "../services/storageService";
 import assert from "node:assert/strict";
 import { applyAgentModelSeen } from "../services/agentModelSeen";
 import { randomUUID } from "node:crypto";
 import { afterEach } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { createApiTest } from "../test/integration/apiTest";
-import { fixturePasswordHash } from "../test/integration/credentials";
-import { users, serverMembers, channels, messages, messageMentions, agents, agentChannelReadCursors, channelAgents, channelHumans } from "../db/schema";
+import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
+import { attachments, users, serverMembers, channels, messages, messageMentions, agents, agentChannelReadCursors, channelAgents, channelHumans } from "../db/schema";
 import { createServer } from "../services/serverService";
 import { createAgent, assignMachine } from "../services/agentService";
 import { registerMachine } from "../services/machineService";
@@ -16,7 +18,7 @@ import { mintAgentCredential } from "../services/agentCredentialService";
 import type { Database } from "../db/index";
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 const originalBindings = process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS;
-afterEach(() => { if (originalBindings === undefined) delete process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS; else process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = originalBindings; });
+afterEach(() => { resetStorageForTests(); if (originalBindings === undefined) delete process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS; else process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS = originalBindings; });
 
 for (const kind of ["dm", "topic"] as const) test(`external ${kind} replies persist native quotes for Web and Agent reads and survive retries`, async ({ db, app }) => {
   const h = await topicFixture(db, app.baseUrl);
@@ -460,4 +462,119 @@ test("topic thread context falls back to a short label when the root has only me
   assert.equal(r.status,200,JSON.stringify(await r.json()));
   const page=await (await h.topicReplies(origin.messageId,"&includeThreadMessages=true")).json();
   assert.equal(page.messages[0].thread.title,"原讨论");
+});
+
+const testPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVQImWNw6TiDFTEMLQkAuRFmAYM6gOUAAAAASUVORK5CYII=', 'base64');
+function attachmentStorage() {
+  const blobs = new Map<string, Buffer>();
+  const storage: StorageBackend = {
+    async put(key, bytes) { blobs.set(key, Buffer.from(bytes)); },
+    async get(key) { const bytes = blobs.get(key); assert.ok(bytes); return Readable.from([bytes]); },
+    async delete(key) { blobs.delete(key); },
+  };
+  __setStorageForTests(storage); __setCdnStorageForTests(storage);
+  return { blobs, storage };
+}
+function multipart(payload: unknown, files = [{ name: '截图.png', bytes: testPng }]) {
+  const form = new FormData(); form.set('payload', JSON.stringify(payload));
+  for (const file of files) form.append('files', new Blob([file.bytes]), file.name);
+  return form;
+}
+
+for (const kind of ['dm', 'topic']) test(`${kind} external images become native attachments readable by Web and Agent, with stable replay`, async ({ db, app }) => {
+  const h = await topicFixture(db, app.baseUrl), { blobs } = attachmentStorage();
+  const endpoint = kind === 'dm' ? '/external-messages/personal/messages' : `/external-messages/personal/topics/${h.channel.id}/messages`;
+  const payload = { externalUserId: h.binding.externalUserId, externalMessageId: 'image-with-caption', content: '请查看图片',
+    ...(kind === 'topic' ? { externalConversationId: 'topic-one', mentionRecipient: true } : {}) };
+  const files = [{ name: '截图.png', bytes: testPng }, { name: '报告.txt', bytes: Buffer.from('supporting file') }];
+  const send = (body = payload, resources = files) => fetch(app.baseUrl + '/internal/agent-api' + endpoint, {
+    method: 'POST', headers: { Authorization: `Bearer ${h.credential.apiKey}` }, body: multipart(body, resources),
+  });
+  assert.equal((await (await h.call('/context')).json()).features.externalMessageAttachments, true);
+  const response = await send(), receipt = await response.json(); assert.equal(response.status, 200, JSON.stringify(receipt));
+  const [message] = await db.select().from(messages).where(eq(messages.id, receipt.messageId));
+  const rows = (await db.select().from(attachments).where(eq(attachments.messageId, receipt.messageId))).sort((a,b) => a.messagePosition! - b.messagePosition!);
+  assert.equal(rows.length, 2); assert.equal(message.senderId, h.owner.id); assert.ok(message.content.endsWith(payload.content));
+  assert.deepEqual(rows.map(row => row.filename), ['截图.png', '报告.txt']);
+  assert.equal(rows[0].mimeType, 'image/png'); assert.ok(rows[0].thumbnailKey);
+  assert.ok(blobs.get(rows[0].thumbnailKey!)!.length > 0, 'native preview generation ran');
+  for (const row of rows) { assert.equal(row.uploaderId, h.owner.id); assert.equal(row.channelId, receipt.channelId); }
+  const resolved = await h.call(`/messages/${message.id}/resolve`, undefined, h.leadKey.apiKey);
+  const resolvedBody = await resolved.json(); assert.equal(resolved.status, 200, JSON.stringify(resolvedBody));
+  assert.deepEqual(resolvedBody.message.attachments.map((a: {id: string}) => a.id), rows.map(row => row.id));
+  const bytes = await h.call(`/attachments/${rows[0].id}`, undefined, h.leadKey.apiKey);
+  assert.equal(bytes.status, 200); assert.deepEqual(Buffer.from(await bytes.arrayBuffer()), testPng);
+  if (kind === 'dm') assert.equal((await h.call(`/attachments/${rows[0].id}`)).status, 404, 'Bridge cannot read private DM files');
+  const headers = { Authorization: `Bearer ${await tokenForHuman(h.owner.email)}`, 'X-Server-Id': h.server.id, 'Sec-Fetch-Site': 'same-origin' };
+  const urlResponse = await fetch(`${app.baseUrl}/api/attachments/${rows[0].id}/url?disposition=attachment`, { headers });
+  assert.equal(urlResponse.status, 200); const { url } = await urlResponse.json();
+  assert.ok(url.startsWith(`/api/attachments/${rows[0].id}?`), url);
+  const downloaded = await fetch(app.baseUrl + url); assert.equal(downloaded.status, 200);
+  assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), testPng);
+  const putCount = blobs.size;
+  const replay = await send(); assert.equal(replay.status, 200); assert.equal((await replay.json()).messageId, receipt.messageId);
+  assert.equal(blobs.size, putCount, 'lost receipts do not re-upload');
+  assert.equal((await send(payload, [{...files[0], bytes: Buffer.from('changed')}, files[1]])).status, 409);
+  assert.equal((await send(payload, [...files].reverse())).status, 409);
+  assert.equal((await send(payload, [{...files[0], name: 'renamed.png'}, files[1]])).status, 409);
+  assert.equal((await h.call(endpoint, payload)).status, 409, 'cannot replay without files');
+  assert.equal((await db.select().from(attachments)).length, rows.length);
+});
+
+test('external attachment ingestion rejects unbound senders, wrong channels and invalid uploads before storage', async ({ db, app }) => {
+  const h = await topicFixture(db, app.baseUrl), { blobs } = attachmentStorage();
+  const body = { externalUserId: h.binding.externalUserId, externalMessageId: 'image', content: 'caption' };
+  const dm = '/external-messages/personal/messages', topic = `/external-messages/personal/topics/${h.channel.id}/messages`;
+  const topicBody = { ...body, externalConversationId: 'topic-one', mentionRecipient: false };
+  const send = (endpoint: string, payload: unknown, token = h.credential.apiKey, form?: FormData) => fetch(app.baseUrl + '/internal/agent-api' + endpoint, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form ?? multipart(payload),
+  });
+  assert.equal((await send(dm, {...body, externalUserId: 'other'})).status, 404);
+  assert.equal((await send(dm, {...body, userId: h.owner.id})).status, 400);
+  assert.equal((await send(dm, {...body, attachmentIds: [randomUUID()]})).status, 400);
+  assert.equal((await send(dm, body, h.leadKey.apiKey)).status, 404);
+  const readonly = await mintAgentCredential({ agentId: h.bridge.id, scopes: ['read'], name: 'read-only', createdByUserId: null });
+  assert.equal((await send(dm, body, readonly.apiKey)).status, 403);
+  assert.equal((await send(topic.replace(h.channel.id, randomUUID()), topicBody)).status, 404);
+  await db.update(channelAgents).set({role:'member'}).where(and(eq(channelAgents.channelId,h.channel.id),eq(channelAgents.agentId,h.bridge.id)));
+  assert.equal((await send(topic, topicBody)).status, 404);
+  await db.update(channelAgents).set({role:'admin'}).where(and(eq(channelAgents.channelId,h.channel.id),eq(channelAgents.agentId,h.bridge.id)));
+  await db.update(channels).set({archivedAt:new Date()}).where(eq(channels.id,h.channel.id));
+  assert.equal((await send(topic, topicBody)).status, 409);
+  assert.equal((await send(dm, body, h.credential.apiKey, multipart(body, [{name:'empty.png',bytes:Buffer.alloc(0)}]))).status, 400);
+  const malformed = multipart(body); malformed.set('payload', '{broken');
+  assert.equal((await send(dm, body, h.credential.apiKey, malformed)).status, 400);
+  assert.equal((await send(dm, body, h.credential.apiKey, multipart(body, [{name:'big.png',bytes:Buffer.alloc(20*1024*1024+1)}]))).status, 413);
+  process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS='[]';
+  assert.equal((await send(dm, body)).status, 404);
+  assert.equal(blobs.size, 0); assert.equal((await db.select().from(attachments)).length, 0);
+});
+
+test('a failed external attachment upload creates no message and a retry keeps every file', async ({ db, app }) => {
+  const h = await fixture(db, app.baseUrl), { storage } = attachmentStorage();
+  const put = storage.put.bind(storage); let fail = true;
+  storage.put = async (...args) => { if (fail) { fail = false; throw new Error('test storage failure'); } return put(...args); };
+  const body = { externalUserId: h.binding.externalUserId, externalMessageId: 'retry-files', content: '请读取附件并概述内容。' };
+  const send = () => fetch(app.baseUrl + '/internal/agent-api/external-messages/personal/messages', {
+    method: 'POST', headers: { Authorization: `Bearer ${h.credential.apiKey}` }, body: multipart(body),
+  });
+  assert.equal((await send()).status, 500);
+  assert.equal((await db.select().from(messages).where(eq(messages.senderId,h.owner.id))).length, 0);
+  const retry = await send(), receipt = await retry.json(); assert.equal(retry.status, 200, JSON.stringify(receipt));
+  const rows = await db.select().from(attachments).where(eq(attachments.messageId,receipt.messageId));
+  assert.equal(rows.length, 1); assert.equal(rows[0].mimeType, 'image/png');
+});
+
+test('external uploads accept the full source-plus-quote file set and reject an extra part', async ({ db, app }) => {
+  const h = await fixture(db, app.baseUrl); attachmentStorage(); __setCdnStorageForTests(null);
+  const files = Array.from({length:16}, (_,i) => ({name:`file-${i}.txt`,bytes:Buffer.from(`file ${i}`)}));
+  const send = (count: number) => fetch(app.baseUrl + '/internal/agent-api/external-messages/personal/messages', {
+    method:'POST',headers:{Authorization:`Bearer ${h.credential.apiKey}`},
+    body:multipart({externalUserId:h.binding.externalUserId,externalMessageId:`files-${count}`,content:'Source and quoted files'},
+      count===16 ? files : [...files, {name:'extra.txt',bytes:Buffer.from('extra')}]),
+  });
+  const response=await send(16),receipt=await response.json(); assert.equal(response.status,200,JSON.stringify(receipt));
+  assert.equal((await db.select().from(attachments).where(eq(attachments.messageId,receipt.messageId))).length,16);
+  assert.equal((await send(17)).status,400);
+  assert.equal((await db.select().from(attachments)).length,16);
 });

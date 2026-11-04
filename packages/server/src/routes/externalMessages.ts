@@ -1,3 +1,4 @@
+import { externalAttachmentFiles, externalAttachmentMetadata, uploadExternalMessageAttachments, respondExternalAttachmentError } from "./externalMessageAttachments";
 import { messageRelations } from "../services/messageRelations";
 import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
@@ -111,10 +112,11 @@ export async function externalDmSend(req: Request, res: Response) {
     if (await isChannelReadOnlyByQuota(dm.id, req.serverId!) || await isChannelReadOnlyByBillingFeature(dm.id, req.serverId!)) {
       res.status(403).json({ code: "external_dm_read_only" }); return;
     }
+    const files = externalAttachmentFiles(req);
     const randomId = "external-message-" + createHash("sha256").update(JSON.stringify([
       binding.serverId, binding.bridgeAgentId, binding.id, input.externalMessageId,
     ])).digest("hex");
-    const metadata = { kind: "external-dm", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
+    const metadata = { ...externalAttachmentMetadata(files), kind: "external-dm", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
       recipientAgentId: agent.id, externalUserId: input.externalUserId, externalMessageId: input.externalMessageId,
       ...(input.replyTo ? { replyTo: input.replyTo, requestDigest: createHash("sha256").update(input.content).digest("hex") } : {}) };
     // Freeze a successful send across URL/slug changes and lost receipts.
@@ -129,14 +131,17 @@ export async function externalDmSend(req: Request, res: Response) {
     }
     const content = await externalReplyContent(input, binding.serverId, dm.id, "dm", res);
     if (content === null) return;
+    const attachmentIds = await uploadExternalMessageAttachments(req, res, dm.id, user.id, files);
+    if (attachmentIds === null) return;
     const message = await messageService.broadcastAndDeliver(req.app.get("io"), req.app.get("agentOrchestrator") as AgentOrchestrator, {
       channelId: dm.id, senderType: "user", senderId: user.id, senderName: user.displayName || user.name,
-      content, randomId, actionMetadata: metadata,
+      content, randomId, actionMetadata: metadata, attachmentIds,
       mentionContract: "v2",
     });
     res.json({ messageId: message.id, messageSeq: message.seq, channelId: dm.id,
       target: `dm:@${user.name}~human`, recipientId: agent.id, recipientHandle: agent.name });
   } catch (err) {
+    if (await respondExternalAttachmentError(req, res, err)) return;
     if (err instanceof messageService.UserRandomIdConflictError) { res.status(409).json({ code: err.code }); return; }
     if (err instanceof channelService.ChannelArchivedError) { res.status(409).json({ code: "channel_archived" }); return; }
     sendJsonServerError(req, res, { error: "Failed to send external DM", logPrefix: "external-dm.send", err });
