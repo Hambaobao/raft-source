@@ -1,4 +1,4 @@
-import { externalAttachmentFiles, externalAttachmentMetadata, uploadExternalMessageAttachments, respondExternalAttachmentError } from "./externalMessageAttachments";
+import { externalAttachmentFiles, externalAttachmentMetadata, uploadExternalMessageAttachments, respondExternalAttachmentError, externalAttachmentPositionsSchema, validExternalAttachmentPositions, withExternalAttachmentLayout, externalAttachmentRequestMetadata } from "./externalMessageAttachments";
 import { messageRelations } from "../services/messageRelations";
 import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
@@ -37,6 +37,7 @@ export const externalMessageInputSchema = z.object({
   externalMessageId: z.string().min(1).max(256),
   content: z.string().min(1).max(32000).refine(value => value.trim().length > 0),
   replyTo: z.string().uuid().optional(),
+  attachmentPositions: externalAttachmentPositionsSchema,
 }).strict();
 export const externalMessageLookupSchema = z.object({
   externalUserId: z.string().min(1).max(256),
@@ -113,17 +114,21 @@ export async function externalDmSend(req: Request, res: Response) {
       res.status(403).json({ code: "external_dm_read_only" }); return;
     }
     const files = externalAttachmentFiles(req);
+    if (!validExternalAttachmentPositions(input.attachmentPositions, input.content, files)) {
+      res.status(400).json({ code: "external_attachment_invalid_positions" }); return;
+    }
     const randomId = "external-message-" + createHash("sha256").update(JSON.stringify([
       binding.serverId, binding.bridgeAgentId, binding.id, input.externalMessageId,
     ])).digest("hex");
-    const metadata = { ...externalAttachmentMetadata(files), kind: "external-dm", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
+    const metadata = { ...externalAttachmentMetadata(files),
+      ...(input.attachmentPositions ? { attachmentPositions: input.attachmentPositions } : {}), kind: "external-dm", bindingId: binding.id, bridgeAgentId: binding.bridgeAgentId,
       recipientAgentId: agent.id, externalUserId: input.externalUserId, externalMessageId: input.externalMessageId,
       ...(input.replyTo ? { replyTo: input.replyTo, requestDigest: createHash("sha256").update(input.content).digest("hex") } : {}) };
     // Freeze a successful send across URL/slug changes and lost receipts.
     const [prior] = await getDb().select().from(messages).where(and(eq(messages.randomId, randomId),
       eq(messages.senderType, "user"), eq(messages.senderId, user.id), eq(messages.serverId, binding.serverId)));
     if (prior) {
-      if (prior.channelId !== dm.id || !isDeepStrictEqual(prior.actionMetadata, metadata)
+      if (prior.channelId !== dm.id || !isDeepStrictEqual(externalAttachmentRequestMetadata(prior.actionMetadata), metadata)
         || (!input.replyTo && prior.content !== input.content)) throw new messageService.UserRandomIdConflictError();
       res.json({ messageId: prior.id, messageSeq: prior.seq, channelId: dm.id,
         target: `dm:@${user.name}~human`, recipientId: agent.id, recipientHandle: agent.name });
@@ -135,7 +140,7 @@ export async function externalDmSend(req: Request, res: Response) {
     if (attachmentIds === null) return;
     const message = await messageService.broadcastAndDeliver(req.app.get("io"), req.app.get("agentOrchestrator") as AgentOrchestrator, {
       channelId: dm.id, senderType: "user", senderId: user.id, senderName: user.displayName || user.name,
-      content, randomId, actionMetadata: metadata, attachmentIds,
+      content, randomId, actionMetadata: withExternalAttachmentLayout(metadata, input.attachmentPositions, input.content, content, attachmentIds), attachmentIds,
       mentionContract: "v2",
     });
     res.json({ messageId: message.id, messageSeq: message.seq, channelId: dm.id,

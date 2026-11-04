@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { createHash } from "node:crypto";
 import multer from "multer";
+import { z } from "zod";
 import { isChannelArchived } from "../services/channelService";
 import { uploadAttachmentBuffers } from "../services/attachmentUploadWriterService";
 import { getCdnStorage, getStorage, isStorageTimeoutError } from "../services/storageService";
@@ -85,4 +86,41 @@ export async function respondExternalAttachmentError(req: Request, res: Response
     res.status(504).json({ code: "external_attachment_storage_timeout" }); return true;
   }
   return false;
+}
+
+// Text offsets retain interleaved images without changing the message body that
+// Agents consume. Only uploaded file indexes are accepted, never foreign IDs.
+export const externalAttachmentPositionsSchema = z.array(z.object({
+  fileIndex: z.number().int().min(0).max(15),
+  textOffset: z.number().int().min(0).max(32000),
+}).strict()).min(1).max(16).optional();
+type AttachmentPosition = { fileIndex: number; textOffset: number };
+
+export function validExternalAttachmentPositions(positions: AttachmentPosition[] | undefined,
+  content: string, files: ReturnType<typeof externalAttachmentFiles>): boolean {
+  const seen = new Set<number>();
+  let previous = 0;
+  return (positions ?? []).every(({ fileIndex, textOffset }) => {
+    if (!files[fileIndex]?.mimeType.startsWith("image/") || seen.has(fileIndex)
+      || textOffset < previous || textOffset > content.length) return false;
+    seen.add(fileIndex); previous = textOffset;
+    return true;
+  });
+}
+
+export function withExternalAttachmentLayout<T extends Record<string, unknown>>(metadata: T,
+  positions: AttachmentPosition[] | undefined, inputContent: string, content: string, attachmentIds: string[]) {
+  if (!positions?.length) return metadata;
+  const prefixLength = content.length - inputContent.length;
+  return { ...metadata, externalAttachmentLayout: { content,
+    items: positions.map(({ fileIndex, textOffset }) => ({
+      attachmentId: attachmentIds[fileIndex], offset: prefixLength + textOffset,
+    })),
+  } };
+}
+
+export function externalAttachmentRequestMetadata(metadata: unknown): unknown {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return metadata;
+  const { externalAttachmentLayout: _layout, ...requestMetadata } = metadata as Record<string, unknown>;
+  return requestMetadata;
 }

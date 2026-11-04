@@ -578,3 +578,31 @@ test('external uploads accept the full source-plus-quote file set and reject an 
   assert.equal((await send(17)).status,400);
   assert.equal((await db.select().from(attachments)).length,16);
 });
+
+for (const kind of ['dm','topic']) test(`${kind} preserves image positions through quotes, mentions and receipt recovery`,async({db,app})=>{
+  const h=await topicFixture(db,app.baseUrl);const {blobs}=attachmentStorage();
+  const initial=await (await (kind==='dm'?h.send():h.topicSend())).json();
+  const quoted=await createMessage(initial.channelId,'agent',h.agent.id,'Original');
+  const endpoint=kind==='dm'?'/external-messages/personal/messages':`/external-messages/personal/topics/${h.channel.id}/messages`;
+  const payload={externalUserId:h.binding.externalUserId,externalMessageId:'ordered-images',content:'between',replyTo:quoted.id,
+    attachmentPositions:[{fileIndex:0,textOffset:0},{fileIndex:1,textOffset:7}],
+    ...(kind==='topic'?{externalConversationId:'topic-one',mentionRecipient:true}:{})};
+  const files=[{name:'first.png',bytes:testPng},{name:'last.png',bytes:testPng}];
+  const send=(body=payload)=>fetch(app.baseUrl+'/internal/agent-api'+endpoint,{
+    method:'POST',headers:{Authorization:`Bearer ${h.credential.apiKey}`},body:multipart(body,files),
+  });
+  const response=await send(),receipt=await response.json();assert.equal(response.status,200,JSON.stringify(receipt));
+  const [stored]=await db.select().from(messages).where(eq(messages.id,receipt.messageId));
+  const linked=(await db.select().from(attachments).where(eq(attachments.messageId,stored.id))).sort((a,b)=>a.messagePosition!-b.messagePosition!);
+  const layout=(stored.actionMetadata as any).externalAttachmentLayout;
+  assert.equal(layout.content,stored.content);
+  assert.deepEqual(layout.items,[{attachmentId:linked[0].id,offset:stored.content.length-7},{attachmentId:linked[1].id,offset:stored.content.length}]);
+  const replay=await send();assert.equal(replay.status,200);assert.equal((await replay.json()).messageId,stored.id);
+  const count=blobs.size;
+  assert.equal((await send({...payload,attachmentPositions:[{fileIndex:0,textOffset:7}]})).status,409);
+  for(const positions of [[{fileIndex:2,textOffset:0}],[{fileIndex:0,textOffset:8}],
+    [{fileIndex:0,textOffset:0},{fileIndex:0,textOffset:1}],[{fileIndex:0,textOffset:7},{fileIndex:1,textOffset:0}]]) {
+    assert.equal((await send({...payload,externalMessageId:randomUUID(),attachmentPositions:positions})).status,400);
+  }
+  assert.equal(blobs.size,count,'invalid ordering never uploads more bytes');
+});

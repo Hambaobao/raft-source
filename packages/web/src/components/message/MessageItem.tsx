@@ -1,3 +1,4 @@
+import { externalAttachmentLayout } from "./externalAttachmentLayout";
 import Tooltip from "../ui/Tooltip";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, Children } from "react";
 import type { ChangeEvent, MouseEvent, PointerEvent as ReactPointerEvent, ReactNode, TouchEvent } from "react";
@@ -3060,7 +3061,6 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
   // Stryker disable all: React effect wiring delegates branch decisions to
   // behavior-tested helpers; source contracts pin the API endpoint and render
   // use sites while the focused mutation oracle avoids full MessageItem DOM.
-  const imageFallbackKey = useMemo(() => buildImageInlineFallbackKey(message.attachments), [message.attachments]);
   // Stryker restore all
 
   const threadFollowed = canShowThreadFollowAction && threadFollowedInStore;
@@ -4242,6 +4242,159 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
     onPositionChange: updateCtxMenuPosition,
   });
 
+  const orderedExternalParts = translatedContent === null && !isActionCardMessage && !forwardedBundleMetadata
+    ? externalAttachmentLayout(message.content, forwardedBundleBodyContent, message.actionMetadata, message.attachments)
+    : null;
+  const positionedAttachmentIds = new Set(orderedExternalParts?.flatMap(part =>
+    part.type === "attachments" ? part.attachments.map(attachment => attachment.id) : []) ?? []);
+  const trailingAttachments = (message.attachments ?? []).filter(attachment => !positionedAttachmentIds.has(attachment.id));
+
+  const renderAttachmentGroup = (attachments: NonNullable<Message["attachments"]>, fallbackUrls?: Record<string, string>) => {
+    if (!attachments.length) return null;
+    if (readOnlyProjection) return <ReadOnlyMessageAttachments attachments={attachments} />;
+    if (forwardedBundleMetadata) return null;
+    const render = (imageFallbackUrls: Record<string, string>) => {
+      // Stryker disable all: pre-existing attachment classification moved under the fallback seam.
+      if (!attachments.length) return null;
+      const renderedImages = attachments.filter(isPreviewableImageAttachment).filter((att) => !!getImageGalleryPreviewSrc(att, imageFallbackUrls));
+      const imageRows = buildMessageImageGalleryRows(renderedImages);
+      const videoAttachments = attachments.filter((att) => isPreviewableVideoAttachment(att));
+      const audioAttachments = attachments.filter((att) => isPreviewableAudioAttachment(att));
+      const otherAttachments = attachments.filter((att) => {
+        if (!isPreviewableImageAttachment(att)) return true;
+        return shouldRenderImageAsAttachmentChip(att, imageFallbackUrls);
+      }).filter((att) => !isPreviewableVideoAttachment(att) && !isPreviewableAudioAttachment(att));
+      // Stryker restore all
+
+      return (
+        <div className="mt-1 space-y-2">
+          {/* Josh's ending matrix: image-terminated rows sit 1px short of
+              the rhythm; same one-pixel knife as the reply card (#9444). */}
+          {imageRows.length > 0 && (
+            <MessageImageGallery className="group-data-[followed-by]/message:mb-px">
+              {imageRows.map((row, rowIndex) => (
+                <MessageImageGalleryRow
+                  key={`${row.items.map((item) => renderedImages[item.index].id).join("-")}-${rowIndex}`}
+                  row={row}
+                >
+                  {row.items.map((item) => {
+                    const att = renderedImages[item.index];
+                    const previewSrc = getImageGalleryPreviewSrc(att, imageFallbackUrls);
+                    if (!previewSrc) return null;
+                    return (
+                      <GalleryImageItem
+                        key={att.id}
+                        att={att}
+                        previewSrc={previewSrc}
+                        isOptimistic={isOptimisticAttachment(att)}
+                        imageIndex={lightboxImages.findIndex((img) => img.id === att.id)}
+                        lightboxImages={lightboxImages}
+                        layout={item}
+                        onDownload={handleDownloadAttachment}
+                      />
+                    );
+                  })}
+                </MessageImageGalleryRow>
+              ))}
+            </MessageImageGallery>
+          )}
+          {videoAttachments.length > 0 && (
+            <div className="space-y-2 group-data-[followed-by]/message:mb-px">
+              {videoAttachments.map((att) => {
+                const isOptimistic = isOptimisticAttachment(att);
+                return (
+                  <InlineVideoAttachmentCard
+                    key={att.id}
+                    attachment={att}
+                    isOptimistic={isOptimistic}
+                    onOpenPreview={handleOpenVideoPreview}
+                    onDownload={handleDownloadAttachment}
+                  />
+                );
+              })}
+            </div>
+          )}
+          {audioAttachments.length > 0 && (
+            <div className="space-y-2">
+              {audioAttachments.map((att) => {
+                const isOptimistic = isOptimisticAttachment(att);
+                return (
+                  <InlineAudioAttachmentCard
+                    key={att.id}
+                    attachment={att}
+                    isOptimistic={isOptimistic}
+                    onDownload={handleDownloadAttachment}
+                  />
+                );
+              })}
+            </div>
+          )}
+          {otherAttachments.length > 0 && (
+            <MessageAttachmentGroup className="max-w-[22.5rem] group-data-[followed-by]/message:mb-px">
+              {otherAttachments.map((att) => {
+                const isImage = isPreviewableImageAttachment(att);
+                const isHtml = isPreviewableHtmlAttachment(att);
+                const isVideo = isPreviewableVideoAttachment(att);
+                const isOptimistic = isOptimisticAttachment(att);
+                const isHtmlLoading = htmlPreviewLoadingId === att.id || videoPreviewLoadingId === att.id || documentPreviewLoadingId === att.id;
+                return (
+                  <AttachmentCard
+                    key={att.id}
+                    attachment={att}
+                    isOptimistic={isOptimistic}
+                    isHtml={isHtml}
+                    isImage={isImage}
+                    isVideo={isVideo}
+                    isAudio={false}
+                    isHtmlLoading={isHtmlLoading}
+                    onClick={handleOpenAttachmentCard}
+                    onDownload={handleDownloadAttachment}
+                  />
+                );
+              })}
+            </MessageAttachmentGroup>
+          )}
+        </div>
+      );
+    };
+    return fallbackUrls ? render(fallbackUrls) : renderWithImageInlineFallback(buildImageInlineFallbackKey(attachments), render);
+  };
+
+  const renderMessageMarkdown = (content: string) => (
+    <MessageMarkdownBody
+      readReceiptChannelId={message.channelId}
+      readReceiptMessageSeq={message.seq}
+      readReceiptEnabled={agentReadBadgesEnabled}
+      content={content}
+      channels={navigableChannels}
+      mentionMap={effectiveMentionMap}
+      structuredMentionMap={effectiveStructuredMentionMap}
+      channelParticipantAgentsById={channelParticipantAgentsById}
+      channelParticipantMembersById={channelParticipantMembersById}
+      channelParticipantExternalsById={channelParticipantExternalsById}
+      unavailableQuotedPermalinkUrl={unavailableQuotedPermalinkUrl}
+      onNavigateChannel={readOnlyProjection ? onReadOnlyNavigateChannel ?? ignoreReadOnlyProjectionNavigation : handleNavigateChannel}
+      onNavigateDm={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateDm}
+      onNavigateAgent={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateAgent}
+      onNavigateHuman={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateHuman}
+      onNavigateExternal={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateExternalMention}
+      onNavigateComputer={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateComputer}
+      onOpenThread={readOnlyProjection ? undefined : handleOpenThreadRef}
+      resolvingThreadRefKey={resolvingThreadRefKey}
+      onOpenTask={readOnlyProjection ? undefined : handleOpenTaskRef}
+      onOpenMessage={readOnlyProjection ? undefined : handleOpenMessageRef}
+      onOpenPermalink={readOnlyProjection ? undefined : handleOpenPermalink}
+      serverSlug={serverSlug}
+      refAuthorityServerSlug={refAuthorityServerSlug}
+      threadRefAuthorityUnavailable={readOnlyProjection || threadRefAuthorityUnavailable}
+      knownTaskNumbers={knownTaskNumbers}
+      taskByNumber={taskByNumber}
+      timeFormatOptions={timeFormatOptions}
+      threadSearchHighlightQuery={threadSearchHighlightQuery}
+      mentionsDisplayOnly={readOnlyProjection}
+    />
+  );
+
   // System messages: centered, compact, no avatar.
   // Title content is summarized server-side; clamp to a single line as a
   // defense-in-depth so any unexpectedly long body still renders on one line.
@@ -4511,38 +4664,14 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
               );
             }
             return (
-              <MessageMarkdownBody
-                readReceiptChannelId={message.channelId}
-                readReceiptMessageSeq={message.seq}
-                readReceiptEnabled={agentReadBadgesEnabled}
-                content={forwardedBundleBodyContent}
-                channels={navigableChannels}
-                mentionMap={effectiveMentionMap}
-                structuredMentionMap={effectiveStructuredMentionMap}
-                channelParticipantAgentsById={channelParticipantAgentsById}
-                channelParticipantMembersById={channelParticipantMembersById}
-                channelParticipantExternalsById={channelParticipantExternalsById}
-                unavailableQuotedPermalinkUrl={unavailableQuotedPermalinkUrl}
-                onNavigateChannel={readOnlyProjection ? onReadOnlyNavigateChannel ?? ignoreReadOnlyProjectionNavigation : handleNavigateChannel}
-                onNavigateDm={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateDm}
-                onNavigateAgent={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateAgent}
-                onNavigateHuman={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateHuman}
-                onNavigateExternal={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateExternalMention}
-                onNavigateComputer={readOnlyProjection ? ignoreReadOnlyProjectionNavigation : handleNavigateComputer}
-                onOpenThread={readOnlyProjection ? undefined : handleOpenThreadRef}
-                resolvingThreadRefKey={resolvingThreadRefKey}
-                onOpenTask={readOnlyProjection ? undefined : handleOpenTaskRef}
-                onOpenMessage={readOnlyProjection ? undefined : handleOpenMessageRef}
-                onOpenPermalink={readOnlyProjection ? undefined : handleOpenPermalink}
-                serverSlug={serverSlug}
-                refAuthorityServerSlug={refAuthorityServerSlug}
-                threadRefAuthorityUnavailable={readOnlyProjection || threadRefAuthorityUnavailable}
-                knownTaskNumbers={knownTaskNumbers}
-                taskByNumber={taskByNumber}
-                timeFormatOptions={timeFormatOptions}
-                threadSearchHighlightQuery={threadSearchHighlightQuery}
-                mentionsDisplayOnly={readOnlyProjection}
-              />
+              orderedExternalParts ? renderWithImageInlineFallback(
+                buildImageInlineFallbackKey((message.attachments ?? []).filter(attachment => positionedAttachmentIds.has(attachment.id))),
+                fallbackUrls => orderedExternalParts.map((part, index) => (
+                  <div key={index} data-external-layout-part={part.type}>
+                    {part.type === "text" ? renderMessageMarkdown(part.text) : renderAttachmentGroup(part.attachments, fallbackUrls)}
+                  </div>
+                )),
+              ) : renderMessageMarkdown(forwardedBundleBodyContent)
             );
           })()}
         </MessageItemBody>
@@ -4613,116 +4742,8 @@ const ConnectedMessageItem = memo(function ConnectedMessageItem({ message, menti
           </div>
         ) : null}
         </CollapsibleMessageContent>
-        {/* Attached files */}
-        {readOnlyProjection && message.attachments && message.attachments.length > 0 ? (
-          <ReadOnlyMessageAttachments attachments={message.attachments} />
-        ) : null}
-        {!readOnlyProjection && !forwardedBundleMetadata && message.attachments && message.attachments.length > 0 && (() => {
-          return renderWithImageInlineFallback(imageFallbackKey, (imageFallbackUrls) => {
-            // Stryker disable all: pre-existing attachment classification moved under the fallback seam.
-            if (!message.attachments) return null;
-            const renderedImages = imagePreviewAttachments.filter((att) => !!getImageGalleryPreviewSrc(att, imageFallbackUrls));
-            const imageRows = buildMessageImageGalleryRows(renderedImages);
-            const videoAttachments = message.attachments.filter((att) => isPreviewableVideoAttachment(att));
-            const audioAttachments = message.attachments.filter((att) => isPreviewableAudioAttachment(att));
-            const otherAttachments = message.attachments.filter((att) => {
-              if (!isPreviewableImageAttachment(att)) return true;
-              return shouldRenderImageAsAttachmentChip(att, imageFallbackUrls);
-            }).filter((att) => !isPreviewableVideoAttachment(att) && !isPreviewableAudioAttachment(att));
-            // Stryker restore all
-
-          return (
-            <div className="mt-1 space-y-2">
-              {/* Josh's ending matrix: image-terminated rows sit 1px short of
-                  the rhythm; same one-pixel knife as the reply card (#9444). */}
-              {imageRows.length > 0 && (
-                <MessageImageGallery className="group-data-[followed-by]/message:mb-px">
-                  {imageRows.map((row, rowIndex) => (
-                    <MessageImageGalleryRow
-                      key={`${row.items.map((item) => renderedImages[item.index].id).join("-")}-${rowIndex}`}
-                      row={row}
-                    >
-                      {row.items.map((item) => {
-                        const att = renderedImages[item.index];
-                        const previewSrc = getImageGalleryPreviewSrc(att, imageFallbackUrls);
-                        if (!previewSrc) return null;
-                        return (
-                          <GalleryImageItem
-                            key={att.id}
-                            att={att}
-                            previewSrc={previewSrc}
-                            isOptimistic={isOptimisticAttachment(att)}
-                            imageIndex={lightboxImages.findIndex((img) => img.id === att.id)}
-                            lightboxImages={lightboxImages}
-                            layout={item}
-                            onDownload={handleDownloadAttachment}
-                          />
-                        );
-                      })}
-                    </MessageImageGalleryRow>
-                  ))}
-                </MessageImageGallery>
-              )}
-              {videoAttachments.length > 0 && (
-                <div className="space-y-2 group-data-[followed-by]/message:mb-px">
-                  {videoAttachments.map((att) => {
-                    const isOptimistic = isOptimisticAttachment(att);
-                    return (
-                      <InlineVideoAttachmentCard
-                        key={att.id}
-                        attachment={att}
-                        isOptimistic={isOptimistic}
-                        onOpenPreview={handleOpenVideoPreview}
-                        onDownload={handleDownloadAttachment}
-                      />
-                    );
-                  })}
-                </div>
-              )}
-              {audioAttachments.length > 0 && (
-                <div className="space-y-2">
-                  {audioAttachments.map((att) => {
-                    const isOptimistic = isOptimisticAttachment(att);
-                    return (
-                      <InlineAudioAttachmentCard
-                        key={att.id}
-                        attachment={att}
-                        isOptimistic={isOptimistic}
-                        onDownload={handleDownloadAttachment}
-                      />
-                    );
-                  })}
-                </div>
-              )}
-              {otherAttachments.length > 0 && (
-                <MessageAttachmentGroup className="max-w-[22.5rem] group-data-[followed-by]/message:mb-px">
-                  {otherAttachments.map((att) => {
-                    const isImage = isPreviewableImageAttachment(att);
-                    const isHtml = isPreviewableHtmlAttachment(att);
-                    const isVideo = isPreviewableVideoAttachment(att);
-                    const isOptimistic = isOptimisticAttachment(att);
-                    const isHtmlLoading = htmlPreviewLoadingId === att.id || videoPreviewLoadingId === att.id || documentPreviewLoadingId === att.id;
-                    return (
-                      <AttachmentCard
-                        key={att.id}
-                        attachment={att}
-                        isOptimistic={isOptimistic}
-                        isHtml={isHtml}
-                        isImage={isImage}
-                        isVideo={isVideo}
-                        isAudio={false}
-                        isHtmlLoading={isHtmlLoading}
-                        onClick={handleOpenAttachmentCard}
-                        onDownload={handleDownloadAttachment}
-                      />
-                    );
-                  })}
-                </MessageAttachmentGroup>
-              )}
-	            </div>
-	          );
-	          });
-	        })()}
+        {/* Attachments without an inline position keep their ordinary placement. */}
+        {renderAttachmentGroup(trailingAttachments)}
         {activeTranslationEntry && shouldRenderTranslationIndicator(activeTranslationEntry) ? (
 	          <div className="mt-0">
 	            <TranslationIndicator
