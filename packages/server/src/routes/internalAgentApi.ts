@@ -1,6 +1,6 @@
 import { parseExternalMessageUpload } from "./externalMessageAttachments";
 import type { MessageRelations } from "../services/messageRelations";
-import { externalTopicSend, externalTopicMessages } from "./externalTopicMessages";
+import { externalTopicSend, externalTopicMessages, externalUserChannels, prepareExternalUserChannel } from "./externalTopicMessages";
 import { externalDmBinding, externalDmSend, externalDmReplies } from "./externalMessages";
 import { raftbenchContextQuerySchema, raftbenchReportSchema } from "@botiverse/raft-shared";
 import { readContext as readRaftbenchContext, submitReport as submitRaftbenchReport, RaftbenchError } from "../raftbench/service";
@@ -2478,7 +2478,7 @@ registerAgentApiRoute("agentContext", async (req, res) => {
       server: { id: server.id, slug: server.slug, name: server.name },
       credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
       prompt,
-      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true, externalTopicThreads: true, messageBodyReads: true, messageCompletions: true, externalDmStream: true, externalUserMessages: true, externalMessageQuotes: true, externalMessageAttachments: true },
+      features: { ...await agentContextFeatures(serverId), nativeReplies: true, externalMessages: true, externalMessageMentions: true, externalTopicStream: true, externalTopicThreads: true, externalTopicAgentScope: true, externalUserChannels: true, messageBodyReads: true, messageCompletions: true, externalDmStream: true, externalUserMessages: true, externalMessageQuotes: true, externalMessageAttachments: true },
     });
   } catch (err) {
     sendJsonServerError(req, res, {
@@ -9679,6 +9679,8 @@ registerAgentApiRoute("raftbenchSubmit", validateAgentApiResponseMiddleware("raf
 
 // Narrow deployment-authorized external user DM transport. It never grants generic user API access.
 internalAgentApiRouter.post("/external-messages/:bindingId/topics/:channelId/messages", requireAgentCapability("send"), requireAgentGrant("message:send"), parseExternalMessageUpload, externalTopicSend);
+internalAgentApiRouter.get("/external-messages/:bindingId/channels", requireAgentCapability("read"), requireAgentGrant("message:read"), externalUserChannels);
+internalAgentApiRouter.post("/external-messages/:bindingId/channels/:channelId", requireAgentCapability("send"), requireAgentGrant("message:send"), prepareExternalUserChannel);
 internalAgentApiRouter.get("/external-messages/:bindingId/topics/:channelId/messages", requireAgentCapability("read"), requireAgentGrant("message:read"), externalTopicMessages);
 internalAgentApiRouter.get("/external-messages/:bindingId", requireAgentCapability("read"), requireAgentGrant("message:read"), externalDmBinding);
 internalAgentApiRouter.post("/external-messages/:bindingId/messages", requireAgentCapability("send"), requireAgentGrant("message:send"), parseExternalMessageUpload, externalDmSend);

@@ -606,3 +606,107 @@ for (const kind of ['dm','topic']) test(`${kind} preserves image positions throu
   }
   assert.equal(blobs.size,count,'invalid ordering never uploads more bytes');
 });
+
+
+test("all-agent topic scope relays only addressed current members and retains coordinator completion ownership", async ({db,app}) => {
+  const h=await topicFixture(db,app.baseUrl),origin=await (await h.topicSend({externalMessageId:"root"})).json();
+  const worker=await createAgent(h.server.id,`ella-${randomUUID().slice(0,8)}`,{runtime:"claude",model:"sonnet"});
+  await addAgent(h.channel.id,worker.id);
+  await db.update(agents).set({displayName:"Ella"}).where(eq(agents.id,worker.id));
+  const key=await mintAgentCredential({agentId:worker.id,scopes:["send"],name:"worker",createdByUserId:null});
+  const thread=await getOrCreateThread(origin.messageId,worker.id,"agent");
+  const web=await createMessage(thread.id,"user",h.owner.id,"My follow-up");
+  const send=async(content:string,threaded=false,extra={})=>{
+    const response=await h.call("/send",{target:threaded?`#${h.channel.name}:${origin.messageId.slice(0,8)}`:`#${h.channel.name}`,content,...extra},key.apiKey);
+    const body=await response.json();assert.equal(response.status,200,JSON.stringify(body));return body;
+  };
+  await send(`@${h.owner.name} main report`);
+  await send(`@${h.owner.name} thread report`,true);
+  await send("Direct reply",true,{replyTo:web.id});
+  const completed=await createMessage(thread.id,"agent",worker.id,"Root report","chat",undefined,
+    {actionMetadata:{kind:"message",replyTo:origin.messageId,completedInputMessageIds:[origin.messageId]}});
+  await send("Internal discussion",true);
+  await send("`@"+h.owner.name+"` is an example",true);
+  const coordinator=await createMessage(h.channel.id,"agent",h.agent.id,"Coordinator done","chat",undefined,
+    {actionMetadata:{kind:"message",replyTo:origin.messageId,completedInputMessageIds:[origin.messageId]}});
+  const legacy=await (await h.topicReplies(origin.messageId,"&includeThreadMessages=true")).json();
+  assert.equal(legacy.agentScope,"coordinator");assert.deepEqual(legacy.messages.map((m:any)=>m.id),[coordinator.id]);
+  const page=await (await h.topicReplies(origin.messageId,"&includeThreadMessages=true&agentScope=all")).json();
+  assert.equal(page.agentScope,"all");
+  assert.deepEqual(page.messages.map((m:any)=>m.content),[`@${h.owner.name} main report`,`@${h.owner.name} thread report`,"Direct reply","Root report","Coordinator done"]);
+  for(const m of page.messages.slice(0,4)){assert.equal(m.senderId,worker.id);assert.equal(m.senderName,"Ella");assert.deepEqual(m.completedInputs,[]);}
+  assert.equal(page.messages[2].recipientReplyTo,web.id);assert.equal(page.messages[3].id,completed.id);
+  assert.deepEqual(page.messages[4].completedInputs,[{messageId:origin.messageId,externalMessageId:"root"}]);
+  assert.deepEqual(page.delivery,legacy.delivery,"worker output must not advance coordinator read facts");
+  const quoted=await h.topicSend({content:"Reply from Feishu",replyTo:page.messages[1].id});assert.equal(quoted.status,200);
+  assert.deepEqual((await (await h.topicReplies(origin.messageId,`&includeThreadMessages=true&agentScope=all&after=${page.nextSeq}`)).json()).messages,[]);
+  assert.equal((await h.topicReplies(origin.messageId,"&agentScope=everyone")).status,400);
+  await db.delete(channelAgents).where(and(eq(channelAgents.channelId,h.channel.id),eq(channelAgents.agentId,worker.id)));
+  assert.deepEqual((await (await h.topicReplies(origin.messageId,"&includeThreadMessages=true&agentScope=all")).json()).messages.map((m:any)=>m.id),[coordinator.id]);
+  await addAgent(h.channel.id,worker.id);await db.update(agents).set({deletedAt:new Date()}).where(eq(agents.id,worker.id));
+  assert.deepEqual((await (await h.topicReplies(origin.messageId,"&includeThreadMessages=true&agentScope=all")).json()).messages.map((m:any)=>m.id),[coordinator.id]);
+});
+
+test("all-agent scope excludes foreign membership, Bridge echoes, other recipients and unrelated channels",async({db,app})=>{
+  const h=await topicFixture(db,app.baseUrl),origin=await (await h.topicSend()).json();
+  const worker=await createAgent(h.server.id,`worker-${randomUUID().slice(0,8)}`,{runtime:"claude",model:"sonnet"});await addAgent(h.channel.id,worker.id);
+  const outsider=await createAgent(h.server.id,`outsider-${randomUUID().slice(0,8)}`,{runtime:"claude",model:"sonnet"});
+  const otherServer=await createServer("Other",`other-${randomUUID().slice(0,8)}`,h.owner.id);
+  const foreign=await createAgent(otherServer.id,`foreign-${randomUUID().slice(0,8)}`,{runtime:"claude",model:"sonnet"});
+  await db.insert(channelAgents).values({channelId:h.channel.id,agentId:foreign.id});
+  const unrelated=await createChannel(h.server.id,`hidden-${randomUUID().slice(0,8)}`,undefined,"private",{type:"agent",id:h.bridge.id,initialAgentIds:[worker.id],initialUserIds:[h.owner.id]});
+  const mention=async(senderId:string,channelId=h.channel.id,target=h.owner.id)=>{
+    const m=await createMessage(channelId,"agent",senderId,"Report");
+    await db.insert(messageMentions).values({messageId:m.id,messageSeq:m.seq,serverId:h.server.id,channelId,targetType:"user",targetId:target,handleAtSendTime:h.owner.name,source:"send_path",confidence:"exact",notifiableAtSend:true});
+    return m;
+  };
+  const valid=await mention(worker.id);
+  await mention(outsider.id);await mention(foreign.id);await mention(h.bridge.id);await mention(worker.id,unrelated.id);await mention(worker.id,h.channel.id,randomUUID());
+  const page=await (await h.topicReplies(origin.messageId,"&agentScope=all&includeThreadMessages=true")).json();
+  assert.deepEqual(page.messages.map((m:any)=>m.id),[valid.id]);
+  await db.delete(channelHumans).where(and(eq(channelHumans.channelId,h.channel.id),eq(channelHumans.userId,h.owner.id)));
+  assert.equal((await h.topicReplies(origin.messageId,"&agentScope=all")).status,404);
+});
+
+test('native channel discovery requires explicit opt-in and current membership, including later joins',async({db,app})=>{
+ const h=await topicFixture(db,app.baseUrl);
+ const listing=()=>h.call('/external-messages/personal/channels?externalUserId=feishu-person');
+ assert.equal((await listing()).status,404);
+ process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS=JSON.stringify([{...h.binding,allowUserChannels:true}]);
+ const native=await createChannel(h.server.id,`native-${randomUUID().slice(0,8)}`,undefined,'private',{type:'agent',id:h.agent.id});
+ const visible=await createChannel(h.server.id,`public-${randomUUID().slice(0,8)}`,undefined,'channel',{type:'agent',id:h.agent.id});
+ let r=await listing();assert.equal(r.status,200,await r.clone().text());let page=await r.json();
+ assert.ok(!page.channels.some((c:any)=>c.id===native.id||c.id===visible.id));
+ await addHuman(native.id,h.owner.id);
+ r=await listing();page=await r.json();const discovered=page.channels.find((c:any)=>c.id===native.id);assert.ok(discovered);
+ assert.equal(page.userId,h.owner.id);assert.ok(Number.isSafeInteger(discovered.joinedAfterSeq));assert.ok(Number.isSafeInteger(page.observedSeq));
+ assert.ok(discovered.url.endsWith('/channel/'+native.id));
+ await db.update(channels).set({archivedAt:new Date()}).where(eq(channels.id,native.id));assert.ok(!(await (await listing()).json()).channels.some((c:any)=>c.id===native.id));
+ await db.update(channels).set({archivedAt:null}).where(eq(channels.id,native.id));await db.delete(channelHumans).where(and(eq(channelHumans.channelId,native.id),eq(channelHumans.userId,h.owner.id)));
+ assert.ok(!(await (await listing()).json()).channels.some((c:any)=>c.id===native.id));
+ assert.equal((await h.call('/external-messages/personal/channels?externalUserId=wrong')).status,404);
+});
+
+test('native channels keep the coordinator present and support addressed replies without a fabricated external anchor',async({db,app})=>{
+ const h=await topicFixture(db,app.baseUrl);
+ process.env.RAFT_EXTERNAL_MESSAGE_BINDINGS=JSON.stringify([{...h.binding,allowUserChannels:true}]);
+ const native=await createChannel(h.server.id,`native-${randomUUID().slice(0,8)}`,undefined,'private',{type:'user',id:h.owner.id});
+ const path=`/external-messages/personal/topics/${native.id}/messages`;
+ const query='?externalUserId=feishu-person&externalConversationId=native-topic&source=raft&agentScope=all';
+ const prepare=()=>h.call(`/external-messages/personal/channels/${native.id}`,{externalUserId:'feishu-person'});
+ const prepared=await prepare();assert.equal(prepared.status,200,await prepared.clone().text());
+ assert.ok(await canAgentAccessChannel(native.id,h.agent.id));assert.equal(await canAgentAccessChannel(native.id,h.bridge.id),false);
+ assert.equal((await prepare()).status,200);
+ assert.equal((await db.select().from(channelAgents).where(and(eq(channelAgents.channelId,native.id),eq(channelAgents.agentId,h.agent.id)))).length,1);
+ const agentReply=await h.call('/send',{target:'#'+native.name,content:`@${h.owner.name} Hello from the channel`},h.leadKey.apiKey);
+ assert.equal(agentReply.status,200,await agentReply.clone().text());
+ const response=await h.call(path+query);assert.equal(response.status,200,await response.clone().text());const page=await response.json();
+ assert.equal(page.anchorMessageId,null);assert.equal(page.source,'raft');assert.equal(page.messages.length,1);
+ const input={externalUserId:'feishu-person',externalConversationId:'native-topic',externalMessageId:'native-input',content:'Follow up',mentionRecipient:true,source:'raft',replyTo:page.messages[0].id};
+ const sent=await h.call(path,input);assert.equal(sent.status,200,await sent.clone().text());const receipt=await sent.json();
+ assert.equal((await (await h.call(path,input)).json()).messageId,receipt.messageId);
+ const [stored]=await db.select().from(messages).where(eq(messages.id,receipt.messageId));assert.equal(stored.senderId,h.owner.id);assert.equal((stored.actionMetadata as any).source,'raft');
+ assert.equal((await h.call(path+'?externalUserId=feishu-person&externalConversationId=native-topic')).status,400,'legacy stream still requires an external anchor');
+ await db.delete(channelHumans).where(and(eq(channelHumans.channelId,native.id),eq(channelHumans.userId,h.owner.id)));
+ assert.equal((await h.call(path+query)).status,404);assert.equal((await h.call(path,{...input,externalMessageId:'removed'})).status,404);assert.equal((await prepare()).status,404);
+});
