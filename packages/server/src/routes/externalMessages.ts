@@ -23,6 +23,7 @@ const bindingSchema = z.object({
   userId: z.string().uuid(), agentId: z.string().uuid(),
   externalUserId: z.string().min(1).max(256),
   allowTopics: z.boolean(),
+  allowUserChannels: z.boolean().default(false),
 }).strict();
 const bindingsSchema = z.array(bindingSchema).max(100).superRefine((rows, ctx) => {
   const ids = new Set<string>(), peers = new Set<string>();
@@ -95,7 +96,8 @@ export async function externalDmBinding(req: Request, res: Response) {
     if (!parsed.success) { res.status(400).json({ code: "external_dm_invalid_request" }); return; }
     const auth = await externalMessageAuthority(req, res, parsed.data.externalUserId);
     if (!auth) return;
-    res.json({ bindingId: auth.binding.id, topicsEnabled: auth.binding.allowTopics === true, user: auth.user, agent: { id: auth.agent.id, name: auth.agent.name } });
+    res.json({ bindingId: auth.binding.id, topicsEnabled: auth.binding.allowTopics === true, userChannelsEnabled: auth.binding.allowUserChannels,
+      user: auth.user, agent: { id: auth.agent.id, name: auth.agent.name } });
   } catch (err) { sendJsonServerError(req, res, { error: "Failed to resolve DM binding", logPrefix: "external-dm.binding", err }); }
 }
 
