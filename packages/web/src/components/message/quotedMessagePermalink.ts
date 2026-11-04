@@ -27,7 +27,7 @@ export function localizeExternalReplyPermalink(content: string, metadata: unknow
     if (url.protocol !== "http:" && url.protocol !== "https:") return content;
     const parsed = parseRaftPermalink(firstLine, url.hostname);
     if (!parsed || parsed.messageId !== relation.replyTo || parsed.channelId !== channelId
-      || parsed.serverSlug !== serverSlug || parsed.threadParentMessageId
+      || parsed.serverSlug !== serverSlug || (parsed.threadParentMessageId && relation.kind !== "external-topic")
       || parsed.routeKind !== (relation.kind === "external-dm" ? "dm" : "channel")) return content;
     return `${origin}${url.pathname}${url.search}${content.slice(firstLine.length)}`;
   } catch { return content; }

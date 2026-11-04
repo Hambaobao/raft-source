@@ -32,6 +32,18 @@ test("external replies use native quote previews and local navigation through SS
   }
 });
 
+test("external topic quotes preserve thread navigation through SSH and HTTPS", () => {
+  const channelId="11111111-1111-1111-1111-111111111111", replyTo="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  const root="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const content=`${FIRST_PERMALINK}&thread=${channelId}%3A${root}\n\nThread reply`;
+  for(const origin of ["http://127.0.0.1:38931","https://lily.example:8443"]) {
+    const localized=localizeExternalReplyPermalink(content,{kind:"external-topic",replyTo},channelId,"botiverse",origin);
+    assert.ok(localized.startsWith(origin));
+    const quote=extractFirstQuotedMessagePermalink(localized,new URL(origin).hostname,"botiverse");
+    assert.equal(quote?.parsed.messageId,replyTo);assert.equal(quote?.parsed.threadParentMessageId,root);
+  }
+});
+
 test("extracts only the first slock permalink without mutating message content", () => {
   const extracted = extractFirstQuotedMessagePermalink(
     `before ${FIRST_PERMALINK} middle ${SECOND_PERMALINK} after`,

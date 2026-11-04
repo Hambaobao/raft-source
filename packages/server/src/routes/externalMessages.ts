@@ -3,7 +3,7 @@ import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
-import { and, asc, eq, gt, isNull, inArray } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, inArray, or } from "drizzle-orm";
 import { getDb } from "../db/index";
 import { agents, users, serverMembers, messages, agentChannelReadCursors, agentMessageBodyReads, messageMentions } from "../db/schema";
 import * as channelService from "../services/channelService";
@@ -50,14 +50,22 @@ export async function externalReplyContent(input: z.infer<typeof externalMessage
   serverId: string, channelId: string, route: "dm" | "channel", res: Response): Promise<string | null> {
   if (!input.replyTo) return input.content;
   const original = await messageService.getMessage(input.replyTo);
-  if (!original || original.channelId !== channelId || original.messageType !== "chat") {
+  let threadParent: string | undefined;
+  if (original && original.channelId !== channelId && route === "channel") {
+    const thread = await channelService.getChannel(original.channelId);
+    const parent = thread?.parentMessageId ? await messageService.getMessage(thread.parentMessageId) : null;
+    if (thread?.type === "thread" && thread.serverId === serverId && !thread.deletedAt
+      && thread.parentChannelId === channelId && parent?.channelId === channelId) threadParent = parent.id;
+  }
+  if (!original || (original.channelId !== channelId && !threadParent) || original.messageType !== "chat") {
     res.status(404).json({ code: "external_reply_unavailable" });
     return null;
   }
   const server = await getServer(serverId);
   if (!server) { res.status(404).json({ code: "external_reply_unavailable" }); return null; }
   // The existing Web quote card and Agent-readable reference use permalinks.
-  const url = `${getAppUrl()}/s/${encodeURIComponent(server.slug)}/${route}/${channelId}?msg=${original.id}`;
+  const url = `${getAppUrl()}/s/${encodeURIComponent(server.slug)}/${route}/${channelId}?msg=${original.id}`
+    + (threadParent ? `&thread=${encodeURIComponent(`${channelId}:${threadParent}`)}` : "");
   return `${url}\n\n${input.content}`;
 }
 export async function externalMessageAuthority(req: Request, res: Response, externalUserId: string) {
@@ -177,12 +185,14 @@ export async function externalDmReplies(req: Request, res: Response) {
 export function externalNativeUserMessages<T extends {
   id: string; seq: number; channelId: string; senderId: string; senderType: string;
   messageType: string; content: string; actionMetadata: unknown;
+  thread?: { parentChannelId: string; parentMessageId: string; title: string; url: string };
 }>(batch: T[], userId: string, senderName: string) {
   return batch.filter(message => {
     const meta = message.actionMetadata as { kind?: unknown } | null;
     return message.senderType === "user" && message.senderId === userId && message.messageType === "chat"
       && (!meta || meta.kind === "message");
-  }).map(({ id, seq, channelId, senderId, senderType, content }) => ({ id, seq, channelId, senderId, senderType, senderName, content }));
+  }).map(({ id, seq, channelId, senderId, senderType, content, thread }) => ({ id, seq, channelId, senderId, senderType, senderName, content,
+    ...(thread ? { thread } : {}) }));
 }
 
 // Only strip a leading address confirmed by Raft's durable, exact mention fact.
@@ -212,14 +222,15 @@ export async function externalReplyPresentation<T extends { id: string; content:
 // address a recipient. Both DM and channel adapters share these relations.
 export async function externalReplyRelations<T extends { actionMetadata: unknown }>(
   replies: T[], auth: NonNullable<Awaited<ReturnType<typeof externalMessageAuthority>>>,
-  channelId: string, externalConversationId?: string,
+  channelId: string, externalConversationId?: string, threadParentMessageId?: string,
 ) {
   const { binding, user, agent } = auth;
   const relations = replies.map(m => messageRelations(m.actionMetadata));
   const ids = [...new Set(relations.flatMap(m => [...(m.replyTo ? [m.replyTo] : []), ...(m.completedInputMessageIds ?? [])]))];
   const originals = ids.length ? await getDb().select({ id: messages.id, senderType: messages.senderType,
     senderId: messages.senderId, content: messages.content, metadata: messages.actionMetadata })
-    .from(messages).where(and(inArray(messages.id, ids), eq(messages.channelId, channelId), eq(messages.messageType, "chat"))) : [];
+    .from(messages).where(and(inArray(messages.id, ids), eq(messages.messageType, "chat"),
+      or(eq(messages.channelId, channelId), threadParentMessageId ? eq(messages.id, threadParentMessageId) : undefined))) : [];
   const byId = new Map(originals.map(m => [m.id, m]));
   const externalId = (source: unknown): string | null => {
     const meta = source as Record<string, unknown> | null;
