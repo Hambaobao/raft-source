@@ -445,3 +445,21 @@ describe("feedback transcript upload: tier-2 machine log tail opt-in", () => {
     assert.equal(result.machineLogTail?.traceBundleId, "bundle-tail-1");
   });
 });
+
+import {vi} from 'vitest';
+for(const mode of ['disabled','unconfigured'] as const)test(`feedback ${mode} reads no private transcript or optional evidence and makes no network calls`,async()=>{
+ let reads=0;const calls:string[]=[];
+ try {
+  vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_DISABLED',mode==='disabled'?'1':'0');
+  const result=await collectFeedbackTranscriptAttachment({agentId:'agent',feedbackReportId:'report',
+   reportWindow:{reportGeneratedAt:'2026-11-03T00:00:00Z',reportTimeSource:'server_request_received'},
+   getSessionTranscript:async()=>{reads++;return {runtime:'codex',sessionId:'synthetic',reachable:true,transcript:TRANSCRIPT,sizeBytes:TRANSCRIPT.length,transcriptContent:'native_session_file'};},
+   getObservedFailureSummary:async()=>{reads++;return null;},getMachineEvidence:async()=>{reads++;return {traceTail:null,machineState:null};},
+   machineLogTail:{include:true,collect:async()=>{reads++;return {reachable:true};}},
+   serverUrl:'http://server.test',daemonApiKey:'synthetic-key',workerUrl:mode==='disabled'?'http://receiver.test':null,
+   tracer:new BasicTracer({sink:new MemoryTraceSink()}),fetchImpl:async url=>{calls.push(url);return new Response(JSON.stringify({attestation:'synthetic-signature',upload:{method:'PUT',url:'http://storage.test/object'}}));},
+  });
+  assert.equal(reads,0);assert.deepEqual(calls,[]);assert.equal(result.upload?.status,'not_attempted');
+  assert.match(result.fallbackReason!,/disabled|receiver/);
+ }finally{vi.unstubAllEnvs();}
+});

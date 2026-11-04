@@ -1,3 +1,4 @@
+import { beforeEach, afterEach, vi } from "vitest";
 // Byte-pin tests for the DiagnosticsPushService (V0 Sync diagnostics).
 //
 // task #102 (#wg-raft-computer:a87e1bdb) fixed the shipped b2 defect: the
@@ -23,6 +24,13 @@ import { gunzipSync } from "node:zlib";
 import { diagnosticsPush } from "./diagnosticsPush";
 import { DIAGNOSTIC_REDACTION_CREDENTIAL_SAMPLES, PEM_PRIVATE_KEY_BEGIN } from "../../../shared/src/test/diagnosticRedactionCredentialSamples";
 import { getDaemonMachineLockId } from "../../../daemon/src/machineLock";
+
+// Upload-positive cases explicitly opt into a receiver; no implicit official target.
+beforeEach(() => {
+  vi.stubEnv("SLOCK_DAEMON_TRACE_UPLOAD_DISABLED", "0");
+  vi.stubEnv("SLOCK_DAEMON_TRACE_UPLOAD_URL", "http://diagnostics.test");
+});
+afterEach(() => vi.unstubAllEnvs());
 
 async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const home = await mkdtemp(path.join(tmpdir(), "raft-computer-diag-svc-"));
@@ -668,3 +676,36 @@ test("diagnosticsPush: orphan END marker is masked in the uploaded body (task263
     assert.ok(uploadedText.includes("runner continued"), "text after END must survive");
   });
 });
+
+for (const forceUploadNow of [false, true]) for (const mode of ['disabled', 'unconfigured', 'invalid'] as const) {
+  test(`diagnosticsPush: ${mode} keeps ${forceUploadNow ? 'migration' : 'manual'} diagnostics local with a usable signer`, async () => {
+    await withHome(async home => {
+      await seedUserSession(home);
+      const serverId = randomUUID();
+      await seedRunningRunner(home, serverId, 'sk_synthetic_runner');
+      await writeFile(path.join(home,'computer','servers',serverId,'runner.log'),'SYNTHETIC_LOCAL_CANARY\n');
+      vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_DISABLED', mode === 'disabled' ? '1' : '0');
+      vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_URL', mode === 'disabled' ? 'http://receiver.test' : mode === 'invalid' ? 'file:///tmp/receiver' : '');
+      const calls: string[] = [];
+      const result = await diagnosticsPush({slockHome:home}, {forceUploadNow,
+        trigger:forceUploadNow?'migration':'user_action',includeComputerTraceRecords:true,
+        ...(mode === 'disabled' ? {workerUrl:'http://override.test'} : {}),
+        fetchImpl:async url => {
+          calls.push(url);
+          return new Response(JSON.stringify({attestation:'synthetic-signature',upload:{method:'PUT',url:'http://storage.test/object'}}));
+        },
+      });
+      assert.equal(result.status,'failed'); if(result.status!=='failed')return;
+      assert.equal(result.reason,'UPLOAD_DISABLED');assert.ok(result.localBundle);
+      assert.match(result.localBundle.path,/computer\/diagnostics\/local-diagnostics-/);
+      assert.match(await readFile(result.localBundle.path,'utf8'),/SYNTHETIC_LOCAL_CANARY/);
+      const files=await readdir(home,{recursive:true});
+      assert.equal(files.some(f=>path.basename(f).startsWith('daemon-trace-diag-')),false);
+      assert.deepEqual(calls,[],'no signer, worker or object request, even for forceUploadNow');
+      // Later enabling uploads must not queue the local-only bundle.
+      vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_DISABLED','0');vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_URL','http://receiver.test');
+      const queued=await diagnosticsPush({slockHome:home});assert.equal(queued.status,'queued');
+      if(queued.status==='queued')assert.ok(queued.markerPaths.every(file=>file!==result.localBundle!.path));
+    });
+  });
+}

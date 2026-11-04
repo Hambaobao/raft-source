@@ -293,3 +293,22 @@ test("stop prevents further uploads after startup", async () => {
 });
 
 });
+
+import {readdir} from 'node:fs/promises';
+import {vi} from 'vitest';
+test('disabled background and manual uploader do not scan or queue traces with an explicit working receiver',async()=>{
+ const dir=await mkdtemp(path.join(os.tmpdir(),'disabled-uploader-'));
+ try {
+  const traceDir=path.join(dir,'traces');await mkdir(traceDir);await writeFile(path.join(traceDir,'daemon-trace-synthetic.jsonl'),'synthetic log\n');
+  const calls:string[]=[];let timers=0;
+  const uploader=new DaemonTraceBundleUploader({machineDir:dir,serverUrl:'http://server.test',apiKey:'synthetic-key',workerUrl:'http://receiver.test',
+   fetchImpl:async url=>{calls.push(url);return jsonResponse({attestation:'signed',upload:{method:'PUT',url:'http://storage.test/object'}});},
+   timers:{setTimeout:(()=>{timers++;return 1;}) as never,setInterval:(()=>{timers++;return 1;}) as never,clearTimeout:()=>{},clearInterval:()=>{}},
+  });
+  vi.stubEnv('SLOCK_DAEMON_TRACE_UPLOAD_DISABLED','1');uploader.start();
+  assert.deepEqual(await uploader.uploadOnce(),{attempted:0,uploaded:0,deferred:0});
+  assert.deepEqual(calls,[]);assert.equal(timers,0);
+  assert.deepEqual(await readdir(path.join(dir,'trace-uploads')).catch(()=>[]),[]);
+  uploader.stop();
+ }finally{vi.unstubAllEnvs();await rm(dir,{recursive:true,force:true});}
+});

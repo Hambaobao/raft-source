@@ -1,3 +1,5 @@
+import { vi } from "vitest";
+import { DaemonTraceBundleUploader } from "./traceBundleUpload";
 import { AgentProxyBindError, RuntimeExecutableNotFoundError, RuntimeModelNotFoundError } from "./spawnFailureErrors";
 import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
@@ -7120,7 +7122,9 @@ test("DaemonCore records a path-free launch_unresolved event when a runtime laun
   }
 });
 
-test("DaemonCore writes local rotating trace file under machine directory when enabled", async () => {
+for (const policy of ["unconfigured", "disabled"] as const) test(`DaemonCore writes local rotating trace file under machine directory when enabled (${policy})`, async () => {
+  vi.stubEnv("SLOCK_DAEMON_TRACE_UPLOAD_DISABLED", policy === "disabled" ? "1" : "0");
+  vi.stubEnv("SLOCK_DAEMON_TRACE_UPLOAD_URL", policy === "disabled" ? "http://receiver.test" : "");
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "slock-daemon-local-trace-core-test-"));
   const dataDir = path.join(rootDir, "agents");
   const machineStateDir = path.join(rootDir, "machines");
@@ -7173,7 +7177,7 @@ test("DaemonCore writes local rotating trace file under machine directory when e
 
     const machineDirs = await readdir(machineStateDir);
     assert.equal(machineDirs.length, 1);
-    const traceDir = path.join(machineStateDir, machineDirs[0], "traces");
+    const traceDir = path.join(machineStateDir, machineDirs[0], "local-diagnostics", "traces");
     const traceFiles = await readdir(traceDir);
     assert.equal(traceFiles.length, 1);
     const raw = await readFile(path.join(traceDir, traceFiles[0]), "utf8");
@@ -7185,7 +7189,17 @@ test("DaemonCore writes local rotating trace file under machine directory when e
     assert.equal(raw.includes("agent-1"), true);
     assert.equal(raw.includes("message-1"), true);
     assert.equal(raw.includes("hello"), false);
+    // Enabling uploads later scans the eligible directory, never local-only traces.
+    vi.stubEnv("SLOCK_DAEMON_TRACE_UPLOAD_DISABLED", "0");
+    let requests = 0;
+    const uploader = new DaemonTraceBundleUploader({ machineDir: path.join(machineStateDir, machineDirs[0]),
+      serverUrl: "http://server.test", apiKey: "synthetic-key", workerUrl: "http://receiver.test",
+      fetchImpl: async () => { requests++; return new Response(JSON.stringify({attestation:"synthetic-signature"})); },
+    });
+    assert.deepEqual(await uploader.uploadOnce(), {attempted:0,uploaded:0,deferred:0});
+    assert.equal(requests,0); uploader.stop();
   } finally {
+    vi.unstubAllEnvs();
     if (!stopped) await core.stop();
     await rm(rootDir, { recursive: true, force: true });
   }

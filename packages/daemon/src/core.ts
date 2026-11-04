@@ -1,3 +1,4 @@
+import { resolveDiagnosticUploadUrl } from "@botiverse/raft-shared";
 export { verifyBundledPiOAuth } from "./bundledPiOAuth";
 export { verifyBundledKimiSdk } from "./drivers/index";
 import {
@@ -168,19 +169,6 @@ import {
   type RuntimeAccountUsageCollector,
 } from "./runtimeAccountUsage/collector";
 
-/**
- * Default endpoint for daemon trace bundle uploads. Always baked as the
- * fallback when no explicit URL is configured — per product decision, the
- * same hosted URL applies across environments (real users connect to
- * hosted prod anyway), with two explicit escape hatches:
- *
- *   1. `SLOCK_DAEMON_TRACE_UPLOAD_DISABLED=1` — highest priority off-switch
- *   2. `SLOCK_DAEMON_TRACE_UPLOAD_URL` — explicit override for any env
- *
- * Self-host / staging / play / local deployments that want no upload must
- * set `DISABLED=1`; those that want their own worker set the URL explicitly.
- */
-const DEFAULT_TRACE_UPLOAD_URL = "https://slock-trace-upload.botiverse.dev";
 const RUNNER_CREDENTIAL_SCOPES = ["send", "read", "mentions", "tasks", "reactions", "server", "channels", "knowledge", "mcp"] as const;
 const RUNNER_CREDENTIAL_MINT_MAX_ATTEMPTS = 3;
 const RUNNER_CREDENTIAL_MINT_RETRY_DELAY_MS = 250;
@@ -1902,7 +1890,6 @@ export class DaemonCore {
     let connection!: DaemonConnection;
 
     this.agentsDataDir = options.dataDir ?? resolveRaftHomePath("agents", this.slockHome);
-    const traceUploadDisabled = process.env.SLOCK_DAEMON_TRACE_UPLOAD_DISABLED === "1";
     const agentManagerOptions = {
       dataDir: this.agentsDataDir,
       serverUrl: options.serverUrl,
@@ -1913,7 +1900,7 @@ export class DaemonCore {
       daemonVersion: this.daemonVersion,
       daemonInstanceId: this.daemonInstanceId,
       computerVersion: this.computerVersion,
-      workerUrl: traceUploadDisabled ? undefined : (process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL || DEFAULT_TRACE_UPLOAD_URL),
+      workerUrl: resolveDiagnosticUploadUrl(process.env),
       serverConnected: () => connection?.connected ?? false,
       appInboxForAgent: (agentId: string) => this.getAgentAppInbox(agentId),
       // Lazy: the local app runtime is created after the agent manager.
@@ -2071,8 +2058,12 @@ export class DaemonCore {
   private installLocalTraceSink(machineDir: string): void {
     if (!this.shouldEnableLocalTrace()) return;
     const jitter = this.resolveTraceJitter();
+    // Do not make local-only traces eligible for upload after a restart that
+    // enables uploads. Keep existing retention and local diagnostic readers.
+    const traceMachineDir = resolveDiagnosticUploadUrl(process.env)
+      ? machineDir : path.join(machineDir, "local-diagnostics");
     this.localTraceSink = new LocalRotatingTraceSink({
-      machineDir,
+      machineDir: traceMachineDir,
       maxFileBytes: this.options.localTraceMaxFileBytes ?? readPositiveIntegerEnv("SLOCK_DAEMON_TRACE_MAX_FILE_BYTES", 5 * 1024 * 1024),
       maxFileAgeMs: this.options.localTraceMaxFileAgeMs ?? readPositiveIntegerEnv("SLOCK_DAEMON_TRACE_MAX_FILE_AGE_MS", 5 * 60 * 1000),
       maxFileAgeJitterMs: jitter.maxFileAgeJitterMs,
@@ -2083,21 +2074,16 @@ export class DaemonCore {
       sinks: [this.localTraceSink],
     }));
     this.agentManager.setTracer(this.tracer);
-    this.agentManager.setCliTransportTraceDir(path.join(machineDir, "traces"));
-    this.agentManager.setMachineDir(machineDir);
+    this.agentManager.setCliTransportTraceDir(path.join(traceMachineDir, "traces"));
+    this.agentManager.setMachineDir(traceMachineDir);
   }
 
   private installTraceBundleUploader(machineDir: string): void {
     if (!this.shouldEnableLocalTrace()) return;
     if (this.traceBundleUploader) return;
 
-    // Highest priority off-switch: SLOCK_DAEMON_TRACE_UPLOAD_DISABLED=1
-    if (process.env.SLOCK_DAEMON_TRACE_UPLOAD_DISABLED === "1") return;
-
-    // Explicit URL override wins; otherwise fall back to the baked default.
-    // Self-host / local / staging etc. must use DISABLED=1 to opt out or
-    // set their own SLOCK_DAEMON_TRACE_UPLOAD_URL to redirect.
-    const workerUrl = process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL || DEFAULT_TRACE_UPLOAD_URL;
+    const workerUrl = resolveDiagnosticUploadUrl(process.env);
+    if (!workerUrl) return;
     this.traceBundleUploader = new DaemonTraceBundleUploader({
       machineDir,
       serverUrl: this.options.serverUrl,

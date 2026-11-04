@@ -9,9 +9,8 @@
 //   1. Generate `correlationId` (uuid).
 //   2. Precondition-check (closed reason union, no surprise throws):
 //      - NO_TRACE_DIR  — `<computerDir>/traces/` not writable
-//      - UPLOAD_DISABLED — env gate (`RAFT_COMPUTER_LOCAL_TRACE=0` flips
-//        the Computer tracer to no-op; without local sink, no marker can
-//        be written; without daemon traces, no bundle gets uploaded)
+//      - UPLOAD_DISABLED — upload opt-out, missing explicit receiver, or
+//        disabled local tracing. Upload opt-out still permits a local bundle.
 //      - OFFLINE — no user session AND no attachments (nothing to upload
 //        under, and the user can't recover the marker from any account)
 //   3. Write a single marker span (`diagnostics.push`) into:
@@ -38,7 +37,7 @@ import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import path from "node:path";
-import { currentDate, redactDiagnosticText } from "@botiverse/raft-shared";
+import { currentDate, redactDiagnosticText, resolveDiagnosticUploadUrl } from "@botiverse/raft-shared";
 
 import {
   computerDir,
@@ -71,7 +70,6 @@ const COMPUTER_BREADCRUMB_PREFIX = "diagnostics-marker-";
 const EXPECTED_WINDOW_SEC = 300;
 const RUNNER_LOG_TAIL_MAX_LINES = 120;
 const RUNNER_LOG_TAIL_MAX_LINE_CHARS = 1_000;
-const DEFAULT_TRACE_UPLOAD_URL = "https://slock-trace-upload.botiverse.dev";
 const TRACE_UPLOAD_SCOPE = "daemon-trace-bundle:create";
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -645,6 +643,14 @@ export async function diagnosticsPush(
     return { status: "failed", reason: "UPLOAD_DISABLED" };
   }
 
+  const workerUrl = resolveDiagnosticUploadUrl(process.env, options.workerUrl);
+  if (!workerUrl) {
+    // Keep diagnostics available locally without a daemon-trace marker that a
+    // later upload pass could pick up after the policy is changed.
+    const localBundle = await writeLocalDiagnosticsBundle({ slockHome, reason: "UPLOAD_DISABLED" }).catch(() => undefined);
+    return { status: "failed", reason: "UPLOAD_DISABLED", ...(localBundle ? { localBundle } : {}) };
+  }
+
   // --- OFFLINE gate: no user-session AND no attachments — there's no
   // identity to upload under and no daemon-side uploader to pick up the
   // marker. (We allow "user-session exists but no attachments" — the
@@ -690,7 +696,6 @@ export async function diagnosticsPush(
     })),
     ...(options.includeComputerTraceRecords ? await readComputerTraceRecords(slockHome) : []),
   ];
-  const workerUrl = options.workerUrl ?? process.env.SLOCK_DAEMON_TRACE_UPLOAD_URL ?? DEFAULT_TRACE_UPLOAD_URL;
 
   // 1. Upload-bearing markers: one per RUNNING runner, into that runner's
   // daemon `machineDir/traces` with the `daemon-trace-` glob-matching name so
