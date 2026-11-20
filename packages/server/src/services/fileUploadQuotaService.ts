@@ -4,6 +4,7 @@ import type { DatabaseTransaction } from "../db/index";
 import { getDb } from "../db/index";
 import { serverFileUploadUsageMonths, servers } from "../db/schema";
 import { getAppUrl } from "../config/appUrl";
+import { configuredMonthlyFileUploadLimitBytes } from "../config/fileUploadQuota";
 import { refreshSubscriptionForServerIfStale } from "./billingService";
 import { getServerBillingEntitlement, withServerResourceLock } from "./planService";
 
@@ -60,13 +61,18 @@ export async function buildFileUploadQuotaExceededResponse(
     ? `/s/${encodeURIComponent(server.slug)}/settings/billing`
     : "/settings/billing";
   const billingUrl = new URL(billingPath, getAppUrl()).toString();
+  const configuredLimit = configuredMonthlyFileUploadLimitBytes();
   return {
-    error: FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE,
+    error: configuredLimit === undefined
+      ? FILE_UPLOAD_QUOTA_EXCEEDED_MESSAGE
+      : `Monthly file upload quota exceeded. This deployment allows ${err.summary.limitBytes} bytes per month.`,
     errorCode: err.errorCode,
     requestedBytes: err.requestedBytes,
     quota: err.summary,
     billingUrl,
-    suggestedNextAction: `Ask a server owner to open Settings > Billing and upgrade to Pro: ${billingUrl}`,
+    suggestedNextAction: configuredLimit === undefined
+      ? `Ask a server owner to open Settings > Billing and upgrade to Pro: ${billingUrl}`
+      : "Ask the deployment administrator to adjust RAFT_MONTHLY_FILE_UPLOAD_LIMIT_BYTES or wait until next month.",
   };
 }
 
@@ -94,9 +100,10 @@ async function getUsageBytes(tx: DatabaseTransaction, serverId: string, month: s
 }
 
 function summarize(plan: ServerPlan, month: string, usedBytes: number, reservedBytes = 0, now = new Date()): FileUploadQuotaSummary {
-  const limited = plan === "free";
-  const enforced = limited && !canUseProBillingFeatures(plan, now);
-  const limitBytes = limited ? FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES : -1;
+  const configuredLimit = configuredMonthlyFileUploadLimitBytes();
+  const limitBytes = configuredLimit ?? (plan === "free" ? FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES : -1);
+  const limited = limitBytes >= 0;
+  const enforced = limited && (configuredLimit !== undefined || !canUseProBillingFeatures(plan, now));
   return {
     month,
     plan,
@@ -104,7 +111,7 @@ function summarize(plan: ServerPlan, month: string, usedBytes: number, reservedB
     enforced,
     limitBytes,
     usedBytes,
-    reservedBytes: limited ? reservedBytes : 0,
+    reservedBytes,
     remainingBytes: limited ? Math.max(0, limitBytes - usedBytes - reservedBytes) : -1,
   };
 }
@@ -145,7 +152,11 @@ export async function reserveFileUploadQuotaForSession<T>(
       throw new FileUploadQuotaExceededError(summary, safeRequestedBytes);
     }
 
-    if (summary.limited && safeRequestedBytes > 0) {
+    // Explicit overrides keep the ledger even when the allowance is unlimited.
+    // reservation.limited records whether bytes were reserved, so finalization
+    // remains correct if the deployment setting changes before completion.
+    const trackUsage = summary.limited || configuredMonthlyFileUploadLimitBytes() !== undefined;
+    if (trackUsage && safeRequestedBytes > 0) {
       await tx
         .insert(serverFileUploadUsageMonths)
         .values({
@@ -168,7 +179,7 @@ export async function reserveFileUploadQuotaForSession<T>(
       serverId,
       month,
       bytes: safeRequestedBytes,
-      limited: summary.limited,
+      limited: trackUsage,
     };
     return work(tx, reservation);
   });

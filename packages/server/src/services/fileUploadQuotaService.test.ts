@@ -1,6 +1,7 @@
 import { dbTest as test } from "../test/integration/dbTest";
 import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
+import { vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES } from "@botiverse/raft-shared";
@@ -18,6 +19,7 @@ import {
 
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await closeTestDatabase();
 });
 
@@ -234,4 +236,63 @@ test("Joint Channel Pro access does not lift the Free participant upload quota",
   assert.equal(proSummary.limited, false);
   assert.equal(proSummary.enforced, false);
   assert.equal(proSummary.limitBytes, -1);
+});
+
+
+test("unlimited deployment quota preserves historic usage and releases failed reservations", async ({ db }) => {
+  const owner = await seedUser("quota-unlimited-owner");
+  const server = await createServer("Quota Unlimited", `quota-unlimited-${randomUUID()}`, owner.id);
+  const now = new Date("2026-11-20T12:00:00Z");
+  await withFileUploadQuota(server.id, FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, async () => "boundary", now);
+  vi.stubEnv("RAFT_MONTHLY_FILE_UPLOAD_LIMIT_BYTES", "-1");
+  await withFileUploadQuota(server.id, 8000, async () => "ok", now);
+  await assert.rejects(() => withFileUploadQuota(server.id, 42, async () => {
+    const pending = await getFileUploadQuotaSummary(server.id, now);
+    assert.equal(pending.reservedBytes, 42);
+    throw new Error("storage failed");
+  }, now), /storage failed/);
+  const summary = await getFileUploadQuotaSummary(server.id, now);
+  assert.equal(summary.plan, "free");
+  assert.equal(summary.limitBytes, -1);
+  assert.equal(summary.remainingBytes, -1);
+  assert.equal(summary.limited, false);
+  assert.equal(summary.enforced, false);
+  assert.equal(summary.usedBytes, FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES + 8000);
+  assert.equal(summary.reservedBytes, 0);
+});
+
+test("explicit deployment cap applies to Pro and concurrent reservations", async ({ db }) => {
+  vi.stubEnv("RAFT_MONTHLY_FILE_UPLOAD_LIMIT_BYTES", "100");
+  const owner = await seedUser("quota-configured-owner");
+  const server = await createServer("Quota Configured", `quota-configured-${randomUUID()}`, owner.id);
+  await getDb().update(servers).set({ plan: "pro" }).where(eq(servers.id, server.id));
+  const now = new Date("2026-06-14T12:00:00Z");
+  const results = await Promise.allSettled([
+    withFileUploadQuota(server.id, 60, async () => "first", now),
+    withFileUploadQuota(server.id, 60, async () => "second", now),
+  ]);
+  assert.equal(results.filter(r => r.status === "fulfilled").length, 1);
+  await withFileUploadQuota(server.id, 40, async () => "boundary", now);
+  await assert.rejects(() => withFileUploadQuota(server.id, 1, async () => "blocked", now), FileUploadQuotaExceededError);
+  const summary = await getFileUploadQuotaSummary(server.id, now);
+  assert.equal(summary.enforced, true);
+  assert.equal(summary.usedBytes, 100);
+  const response = await buildFileUploadQuotaExceededResponse(server.id, new FileUploadQuotaExceededError(summary, 1));
+  assert.match(response.error, /deployment allows 100 bytes/);
+  assert.match(response.suggestedNextAction, /deployment administrator/);
+  vi.stubEnv("RAFT_MONTHLY_FILE_UPLOAD_LIMIT_BYTES", "0");
+  await assert.rejects(() => withFileUploadQuota(server.id, 1, async () => "blocked", now), FileUploadQuotaExceededError);
+});
+
+test("reservation accounting survives a quota configuration change during upload", async ({ db }) => {
+  vi.stubEnv("RAFT_MONTHLY_FILE_UPLOAD_LIMIT_BYTES", "-1");
+  const owner = await seedUser("quota-transition-owner");
+  const server = await createServer("Quota Transition", `quota-transition-${randomUUID()}`, owner.id);
+  await withFileUploadQuota(server.id, 80, async () => {
+    vi.stubEnv("RAFT_MONTHLY_FILE_UPLOAD_LIMIT_BYTES", "100");
+  });
+  const summary = await getFileUploadQuotaSummary(server.id);
+  assert.equal(summary.usedBytes, 80);
+  assert.equal(summary.reservedBytes, 0);
+  assert.equal(summary.remainingBytes, 20);
 });
